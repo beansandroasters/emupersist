@@ -32,3 +32,6 @@ credentials
 
 # Sample journals for the compatibility tests (they contain only test values)
 !/tests/fixtures/*.jsonl
+
+# Local agent worktrees and settings (never part of the project)
+.claude/
