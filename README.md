@@ -30,30 +30,77 @@ The HTTP interface, on the other hand, is the same for every service, and the em
 So emupersist leaves the emulator's internals alone and rebuilds state from outside, over HTTP (event sourcing).
 This keeps working as the emulator adds services.
 
-## Build
+## Quick start (Linux)
+
+### 1. Install aws-emulator
+
+Follow the [official guide](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html). For example, on x86_64:
 
 ```bash
-cargo build --release                         # with SQLite (needs a C compiler)
-cargo build --release --no-default-features   # without SQLite (pure-Rust dependencies only)
+# RPM (Amazon Linux, Fedora, RHEL)
+sudo dnf install -y https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-x86_64.rpm
+
+# Debian package (Debian, Ubuntu)
+curl -fsSLo aws-emulator.deb https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+sudo apt-get install -y ./aws-emulator.deb
 ```
 
-Requires Rust 1.89 or later (the highest minimum among the dependencies).
-Install aws-emulator by following the [official guide](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html).
+Both packages put the binary at `/opt/aws-emulator/bin/aws-emulator` and link it as `/usr/bin/aws-emulator`, so `aws-emulator --version` works right away.
+You do not start aws-emulator yourself: emupersist starts it in the next steps.
 
-## Usage
+### 2. Install emupersist
 
 ```bash
-# put aws-emulator on PATH, or pass its location with --emulator
-./target/release/emupersist run --store file:.emupersist/journal.jsonl -- -t off
+cargo install --locked --git https://github.com/beansandroasters/emupersist
+```
 
-# in another shell
+This builds from source and puts `emupersist` in `~/.cargo/bin` (Rust 1.89 or later and a C compiler for the bundled SQLite are required; the first build takes a few minutes).
+
+### 3. Start it
+
+```bash
+mkdir my-project && cd my-project
+emupersist run -- -t off
+```
+
+`emupersist run` starts aws-emulator as a child process and listens on `http://127.0.0.1:4566`.
+It records state-changing requests in `.emupersist/journal.jsonl` **under the directory where you ran it**.
+Arguments after `--` go to aws-emulator; `-t off` turns its telemetry off and can be omitted.
+
+### 4. Use it from another shell
+
+```bash
 export AWS_ENDPOINT_URL=http://127.0.0.1:4566 AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=AKIATEST AWS_SECRET_ACCESS_KEY=dummy
-aws dynamodb list-tables
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test   # any value: signatures are not checked
+
+aws dynamodb create-table --table-name todos \
+  --attribute-definitions AttributeName=id,AttributeType=S \
+  --key-schema AttributeName=id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+aws dynamodb wait table-exists --table-name todos
+aws dynamodb put-item --table-name todos --item '{"id":{"S":"1"},"title":{"S":"buy milk"}}'
 ```
 
-Arguments after `--` are passed to aws-emulator as is (the example turns telemetry off).
-Stop with Ctrl-C and `run` again: emupersist replays the journal before it starts listening.
+### 5. Stop it and start it again
+
+Stop emupersist with Ctrl-C, then run `emupersist run -- -t off` again **in the same directory**.
+It replays the journal before it starts listening, so the table and the item are back.
+Wait until it prints `{"endpoint_url":"http://127.0.0.1:4566"}`: requests sent before that line, while it is still replaying, are refused.
+
+```bash
+aws dynamodb get-item --table-name todos --key '{"id":{"S":"1"}}' --query Item.title.S --output text
+# buy milk
+emupersist inspect   # lists what was recorded
+```
+
+To start over, stop emupersist and run `emupersist reset` (or delete `.emupersist/`).
+
+If aws-emulator is somewhere other than your `PATH`, pass it with `--emulator /path/to/aws-emulator`.
+To keep the journal somewhere else, pass `--store`: `file:` followed by a path is a local file, and the other kinds are in [Stores](#stores).
+
+On macOS and Windows, the official guide runs aws-emulator in a Docker container, so `emupersist run` cannot start it.
+`emupersist proxy` can sit in front of an emulator you started yourself with `-a off`, but this combination has not been tested.
+
+## Commands and options
 
 | Command | What it does |
 |---|---|
@@ -81,12 +128,21 @@ While running, emupersist serves admin routes:
 - `GET /__persist/journal` returns the list of records (without bodies)
 - `POST /__persist/reset` deletes the journal and restarts the emulator (`run` only)
 
+## Building from source
+
+```bash
+cargo build --release                         # with SQLite (needs a C compiler)
+cargo build --release --no-default-features   # without SQLite (pure-Rust dependencies only)
+```
+
+Requires Rust 1.89 or later (the highest minimum among the dependencies). The binary is `target/release/emupersist`.
+
 ## Stores
 
 There is no configuration file. You pass the store as a URL.
 
 ```bash
-emupersist run --store file:.emupersist/journal.jsonl
+emupersist run --store file:.emupersist/journal.jsonl   # the default
 emupersist run --store sqlite:./state.db --namespace feature-x
 emupersist init-store --store "dynamodb://my-journal?region=ap-northeast-1"   # create the table
 emupersist run        --store "dynamodb://my-journal?region=ap-northeast-1"
