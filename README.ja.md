@@ -30,30 +30,79 @@ SDK / CLI ──HTTP──▶ emupersist :4566 ──HTTPS──▶ aws-emulator
 そこで emupersist はエミュレータの内部に触れず、外から HTTP で状態を作り直します(イベントソーシング)。
 エミュレータにサービスが増えても、この方式はそのまま使えます。
 
-## ビルド
+## はじめ方
+
+Linux での手順です(macOS と Windows については、この節の最後を参照)。
+
+### 1. aws-emulator を入れる
+
+[公式の手順](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html)に従って入れます。x86_64 なら、たとえば次のとおりです。
 
 ```bash
-cargo build --release                         # SQLite 込み(C コンパイラが要る)
-cargo build --release --no-default-features   # SQLite なし(純 Rust の依存だけ)
+# RPM(Amazon Linux、Fedora、RHEL)
+sudo dnf install -y https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-x86_64.rpm
+
+# Debian パッケージ(Debian、Ubuntu)
+curl -fsSLo aws-emulator.deb https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator_amd64.deb
+sudo apt-get install -y ./aws-emulator.deb
 ```
 
-Rust 1.89 以上が必要です(依存クレートが求める最低バージョンのうち、最も新しいもの)。
-aws-emulator は[公式の手順](https://docs.aws.amazon.com/emulator/latest/userguide/getting-started-linux.html)に従って入れてください。
+どちらのパッケージも、実行ファイルを `/opt/aws-emulator/bin/aws-emulator` に置き、`/usr/bin/aws-emulator` にリンクを作ります。そのため、入れた直後から `aws-emulator --version` が動きます。
+aws-emulator を自分で起動する必要はありません。この後の手順で、emupersist が起動します。
 
-## 使い方
+### 2. emupersist を入れる
 
 ```bash
-# aws-emulator を PATH に置くか、--emulator で場所を渡す
-./target/release/emupersist run --store file:.emupersist/journal.jsonl -- -t off
+cargo install --locked --git https://github.com/beansandroasters/emupersist
+```
 
-# 別のシェルで
+ソースからビルドして、`~/.cargo/bin` に `emupersist` を置きます。Rust 1.89 以上と、同梱の SQLite をビルドするための C コンパイラが必要です。初回のビルドには数分かかります。
+
+### 3. 起動する
+
+```bash
+mkdir my-project && cd my-project
+emupersist run -- -t off
+```
+
+`emupersist run` は aws-emulator を子プロセスとして起動し、`http://127.0.0.1:4566` で待ち受けます。
+状態を変えたリクエストは、**コマンドを打ったディレクトリの** `.emupersist/journal.jsonl` に記録します。
+`--` より後ろの引数は aws-emulator に渡ります。`-t off` は aws-emulator のテレメトリを切る指定で、省略してもかまいません。
+
+### 4. 別のシェルから使う
+
+```bash
 export AWS_ENDPOINT_URL=http://127.0.0.1:4566 AWS_REGION=us-east-1
-export AWS_ACCESS_KEY_ID=AKIATEST AWS_SECRET_ACCESS_KEY=dummy
-aws dynamodb list-tables
+export AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test   # 署名は検証しないので、値は何でもよい
+
+aws dynamodb create-table --table-name todos \
+  --attribute-definitions AttributeName=id,AttributeType=S \
+  --key-schema AttributeName=id,KeyType=HASH --billing-mode PAY_PER_REQUEST
+aws dynamodb wait table-exists --table-name todos
+aws dynamodb put-item --table-name todos --item '{"id":{"S":"1"},"title":{"S":"buy milk"}}'
 ```
 
-`--` より後ろの引数はそのまま aws-emulator に渡ります(上の例ではテレメトリを切っています)。
-Ctrl-C で止めてもう一度 `run` すると、emupersist はジャーナルを流し直してから待ち受けを始めます。
+### 5. 止めてもう一度起動する
+
+Ctrl-C で emupersist を止め、**同じディレクトリで**もう一度 `emupersist run -- -t off` を打ちます。
+待ち受けを始める前にジャーナルを流し直すので、テーブルと項目が戻っています。
+`{"endpoint_url":"http://127.0.0.1:4566"}` という行が出るまで待ってください。その前はまだ流し直している途中で、送ったリクエストは接続を断られます。
+
+```bash
+aws dynamodb get-item --table-name todos --key '{"id":{"S":"1"}}' --query Item.title.S --output text
+# buy milk
+emupersist inspect   # 記録した内容を一覧で見る
+```
+
+最初からやり直すときは、emupersist を止めてから `emupersist reset` を打ちます(`.emupersist/` を消しても同じです)。
+
+aws-emulator が `PATH` の通っていない場所にあるときは、`--emulator /path/to/aws-emulator` でその場所を渡します。
+ジャーナルを別の場所に置くときは、`--store` で指定します。`file:` の後ろにパスを書くとローカルのファイルになります。ほかの種類は[保存先](#保存先)にあります。
+
+macOS と Windows では、公式の手順が aws-emulator を Docker のコンテナで動かすので、`emupersist run` では起動できません。
+`-a off` で自分で起動したエミュレータの前に `emupersist proxy` を置くことはできますが、この組み合わせはまだ試していません。
+
+## コマンドとオプション
 
 | コマンド | 働き |
 |---|---|
@@ -81,12 +130,21 @@ Ctrl-C で止めてもう一度 `run` すると、emupersist はジャーナル�
 - `GET /__persist/journal` は記録の一覧をボディを除いて返す
 - `POST /__persist/reset` はジャーナルを消してエミュレータを起動し直す(`run` のときだけ)
 
+## ソースからのビルド
+
+```bash
+cargo build --release                         # SQLite 込み(C コンパイラが要る)
+cargo build --release --no-default-features   # SQLite なし(純 Rust の依存だけ)
+```
+
+Rust 1.89 以上が必要です(依存クレートが求める最低バージョンのうち、最も新しいもの)。実行ファイルは `target/release/emupersist` にできます。
+
 ## 保存先
 
 設定ファイルはありません。保存先は URL で渡します。
 
 ```bash
-emupersist run --store file:.emupersist/journal.jsonl
+emupersist run --store file:.emupersist/journal.jsonl   # 既定の保存先
 emupersist run --store sqlite:./state.db --namespace feature-x
 emupersist init-store --store "dynamodb://my-journal?region=ap-northeast-1"   # テーブルを作る
 emupersist run        --store "dynamodb://my-journal?region=ap-northeast-1"
