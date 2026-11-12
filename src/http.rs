@@ -1,8 +1,8 @@
-//! std の TcpStream の上に書いた最小限の HTTP/1.1。
+//! A minimal HTTP/1.1 written on top of std's TcpStream.
 //!
-//! 扱うのは、Content-Length と chunked の本文、keep-alive、`Expect: 100-continue`、
-//! HEAD / 204 / 304 の本文なし応答だけ。これで AWS SDK と aws-emulator のあいだに立てる。
-//! hyper と tokio を入れれば短く書けるが、依存が数十クレート増える。
+//! It handles only Content-Length and chunked bodies, keep-alive, `Expect: 100-continue`,
+//! and bodiless HEAD / 204 / 304 responses. That is enough to sit between the AWS SDK and aws-emulator.
+//! With hyper and tokio it would be shorter, but it would add dozens of crates as dependencies.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -13,7 +13,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 pub type Headers = Vec<(String, String)>;
 
-/// 転送の単位を決めるヘッダ。プロキシは中継せず、自分で付け直す。
+/// Headers that govern framing of the transfer. The proxy does not forward them and sets them itself.
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -54,13 +54,14 @@ fn bad(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// ヘッダ1行の上限。AWS の署名ヘッダでも数 KB に収まる。
+/// The limit for one header line. Even AWS signature headers fit in a few KB.
 const MAX_LINE: usize = 16 * 1024;
-/// ヘッダ部全体の上限と、ヘッダの個数の上限。
+/// The limit for the whole header section, and the limit for the number of headers.
 const MAX_HEAD: usize = 256 * 1024;
 const MAX_HEADERS: usize = 256;
 
-/// 要求を読めなかった理由。`Reject` はクライアントに状態コードで返し、`Io` は接続を閉じる。
+/// Why a request could not be read. `Reject` is returned to the client as a status code, and `Io` closes the
+/// connection.
 #[derive(Debug)]
 pub enum ReadError {
     Io(io::Error),
@@ -82,7 +83,8 @@ impl std::fmt::Display for ReadError {
     }
 }
 
-/// 1行読む(改行込み)。`max` を超える行は 431 で断る。接続が閉じていれば None。
+/// Reads one line (including the newline). Lines longer than `max` are rejected with 431. Returns None if the
+/// connection is closed.
 fn read_line_limited<R: BufRead>(r: &mut R, max: usize) -> Result<Option<String>, ReadError> {
     let mut line = Vec::new();
     loop {
@@ -111,12 +113,12 @@ fn read_line_limited<R: BufRead>(r: &mut R, max: usize) -> Result<Option<String>
     }
 }
 
-/// 空行までのヘッダ部を読む。接続が閉じていたら None。
+/// Reads the header section up to the empty line. Returns None if the connection is closed.
 fn read_head<R: BufRead>(r: &mut R) -> Result<Option<(String, Headers)>, ReadError> {
     let first = loop {
         match read_line_limited(r, MAX_LINE)? {
             None => return Ok(None),
-            Some(l) if l.trim().is_empty() => continue, // 要求のあいだの空行は読み飛ばす(RFC 9112 2.2)
+            Some(l) if l.trim().is_empty() => continue, // Skip empty lines between requests (RFC 9112 2.2)
             Some(l) => break l,
         }
     };
@@ -139,7 +141,8 @@ fn read_head<R: BufRead>(r: &mut R) -> Result<Option<(String, Headers)>, ReadErr
     Ok(Some((first.trim_end().to_string(), headers)))
 }
 
-/// ちょうど n バイト読む。先に n バイト確保せず、届いた分だけ伸ばす(巨大な宣言値で確保に失敗しないため)。
+/// Reads exactly n bytes. It does not allocate n bytes up front and grows only as data arrives (so a huge declared
+/// length does not make allocation fail).
 fn read_exactly<R: Read>(r: &mut R, n: u64, out: &mut Vec<u8>) -> io::Result<()> {
     let before = out.len();
     r.take(n).read_to_end(out)?;
@@ -163,7 +166,7 @@ fn read_chunked<R: BufRead>(r: &mut R, max: usize) -> Result<Vec<u8>, ReadError>
             .map_err(|_| ReadError::Reject(400, format!("chunk の大きさが読めない: {line:?}")))?;
         if size == 0 {
             loop {
-                // trailer は読み捨てる
+                // Read and discard the trailer
                 let t = read_line_limited(r, MAX_LINE)?.ok_or_else(eof)?;
                 if t == "\r\n" || t == "\n" {
                     return Ok(out);
@@ -209,7 +212,8 @@ fn read_body<R: BufRead>(r: &mut R, headers: &Headers, until_eof: bool, max: usi
     Ok(body)
 }
 
-/// `Connection` ヘッダ(カンマ区切りのトークン)と HTTP の版から、この応答の後に接続を閉じるべきかを決める。
+/// Decides from the `Connection` header (comma-separated tokens) and the HTTP version whether the connection should
+/// be closed after this response.
 pub fn wants_close(version: &str, headers: &Headers) -> bool {
     let has = |token: &str| {
         headers
@@ -224,8 +228,8 @@ pub fn wants_close(version: &str, headers: &Headers) -> bool {
     }
 }
 
-/// サーバ側: 要求を1つ読む。`Expect: 100-continue` には本文を読む前に 100 を返す。
-/// 戻り値の2つ目は、応答の後に接続を閉じるべきか。
+/// Server side: reads one request. For `Expect: 100-continue`, sends 100 before reading the body.
+/// The second return value tells whether the connection should be closed after the response.
 pub fn read_request<R: BufRead, W: Write>(
     r: &mut R,
     w: &mut W,
@@ -237,7 +241,8 @@ pub fn read_request<R: BufRead, W: Write>(
         (Some(m), Some(t), v) => (m.to_string(), t.to_string(), v.unwrap_or("HTTP/1.0").to_string()),
         _ => return Err(ReadError::Reject(400, format!("壊れた要求行: {line}"))),
     };
-    // 両方あると、前後の機器で本文の切れ目の解釈が割れる(要求の密輸)。RFC 9112 6.1 に従って断る
+    // With both present, hops before and after may disagree on where the body ends (request smuggling). Reject
+    // per RFC 9112 6.1
     if header(&headers, "transfer-encoding").is_some() && header(&headers, "content-length").is_some() {
         return Err(ReadError::Reject(400, "Transfer-Encoding と Content-Length が両方ある".into()));
     }
@@ -247,7 +252,7 @@ pub fn read_request<R: BufRead, W: Write>(
     if header(&headers, "expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue")) {
         let declared = header(&headers, "content-length").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         if declared > max_body as u64 {
-            return Err(too_large(max_body)); // 100 を返す前に断れば、クライアントは本文を送らない
+            return Err(too_large(max_body)); // Rejecting before sending 100 means the client does not send the body
         }
         w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
         w.flush()?;
@@ -285,10 +290,11 @@ pub fn reason(status: u16) -> &'static str {
     }
 }
 
-/// サーバ側: 応答を1回の write で書く(ヘッダと本文を分けて書くと Nagle と遅延 ACK で待たされる)。
+/// Server side: writes the response in a single write (writing headers and body separately stalls on Nagle and
+/// delayed ACK).
 ///
-/// 204 と 304 には Content-Length を付けない(RFC 9110 8.6)。HEAD のときは本文を書かず、
-/// Content-Length は上流が伝えた値をそのまま返す(上流が付けていなければ付けない)。
+/// 204 and 304 get no Content-Length (RFC 9110 8.6). For HEAD, no body is written, and Content-Length is the value
+/// the upstream sent, passed through as is (omitted if the upstream did not send one).
 pub fn write_response<W: Write>(w: &mut W, resp: &Response, head: bool, close: bool) -> io::Result<()> {
     let mut out = format!("HTTP/1.1 {} {}\r\n", resp.status, reason(resp.status)).into_bytes();
     let mut length = None;
@@ -319,7 +325,7 @@ pub fn write_response<W: Write>(w: &mut W, resp: &Response, head: bool, close: b
     w.flush()
 }
 
-// --- クライアント ---------------------------------------------------------
+// --- Client ---------------------------------------------------------------
 
 enum Stream {
     Plain(TcpStream),
@@ -350,7 +356,7 @@ impl Write for Stream {
     }
 }
 
-/// 1つの宛先への keep-alive 接続のプール。スレッドをまたいで使い回す。
+/// A pool of keep-alive connections to one destination. Shared across threads.
 pub struct Client {
     pub url: String,
     pub scheme: String,
@@ -364,7 +370,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// `ca` があればその CA だけを信頼する(エミュレータの自己署名 CA)。なければ webpki-roots。
+    /// If `ca` is given, trusts only that CA (the emulator's self-signed CA). Otherwise uses webpki-roots.
     pub fn new(url: &str, ca: Option<&str>, insecure: bool, timeout: Duration) -> Result<Self, String> {
         let (scheme, rest) = url.split_once("://").ok_or_else(|| format!("URL ではない: {url}"))?;
         let (authority, path) = match rest.find('/') {
@@ -416,11 +422,12 @@ impl Client {
         Ok(BufReader::with_capacity(64 * 1024, stream))
     }
 
-    /// 要求を送って応答を読む。`path` は base_path の後ろに付く(クエリ込み)。
+    /// Sends a request and reads the response. `path` is appended to base_path (including the query).
     ///
-    /// 使い回した接続がすでに閉じられていたときは、新しい接続で1回だけやり直す。やり直すのは、
-    /// 応答を1バイトも受け取る前に接続が切れていた場合だけ(エミュレータが要求を処理していないので、
-    /// 書き込み系でも二重適用にならない)。応答の途中で切れた場合はやり直さず、エラーにする。
+    /// If a reused connection has already been closed, retries once on a new connection. It retries only when the
+    /// connection was lost before a single byte of the response arrived (the emulator has not processed the request,
+    /// so even a write is not applied twice). If the connection is lost in the middle of the response, it does not
+    /// retry and returns an error.
     pub fn send(&self, method: &str, path: &str, headers: &Headers, body: &[u8]) -> io::Result<Response> {
         let full = format!("{}{}", self.base_path, path);
         let mut req = format!("{method} {full} HTTP/1.1\r\n").into_bytes();
@@ -478,7 +485,8 @@ impl Client {
         };
         conn.get_mut().write_all(req).map_err(stale)?;
         conn.get_mut().flush().map_err(stale)?;
-        // 応答の最初のバイトが来るまでに切れたかどうかで、やり直してよいかが決まる
+        // Whether a retry is allowed depends on whether the connection was lost before the first byte of the
+        // response
         match conn.fill_buf() {
             Ok([]) => {
                 return Err(Exchange::BeforeResponse(io::Error::new(
@@ -506,13 +514,14 @@ impl Client {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| Exchange::After(bad(format!("壊れた状態行: {line}"))))?;
             if (100..200).contains(&status) {
-                continue; // 100 Continue などの中間応答
+                continue; // Interim responses such as 100 Continue
             }
             let close = wants_close(&version, &headers);
             let no_body = head || status == 204 || status == 304;
             let has_len = header(&headers, "content-length").is_some() || is_chunked(&headers);
-            // 上流(エミュレータ・AWS)の応答は信頼する相手なので、大きさの上限は掛けない。
-            // 宣言された大きさを先に確保しないので、壊れた値でも確保の失敗では落ちない
+            // Responses from the upstream (the emulator, AWS) are trusted, so no size limit is applied.
+            // The declared size is not allocated up front, so even a broken value does not crash on allocation
+            // failure
             let body = if no_body { Vec::new() } else { read_body(conn, &headers, true, usize::MAX).map_err(after)? };
             return Ok((Response { status, headers, body }, !close && (no_body || has_len)));
         }
@@ -520,7 +529,7 @@ impl Client {
 }
 
 enum Exchange {
-    /// 応答を1バイトも受け取る前に切れた(使い回した接続が向こうで閉じられていた)
+    /// Lost before a single byte of the response arrived (the peer had closed the reused connection)
     BeforeResponse(io::Error),
     After(io::Error),
 }
@@ -553,7 +562,7 @@ fn tls_config(ca: Option<&str>, insecure: bool) -> Result<rustls::ClientConfig, 
     Ok(builder.with_root_certificates(roots).with_no_client_auth())
 }
 
-/// `--insecure` を明示したときだけ使う。証明書を検証しない。
+/// Used only when `--insecure` is given explicitly. Does not verify certificates.
 #[derive(Debug)]
 struct NoVerify(Arc<rustls::crypto::CryptoProvider>);
 
@@ -613,7 +622,7 @@ mod tests {
     fn huge_content_length_is_rejected_without_allocating() {
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 999999999999999\r\n\r\nabc";
         assert!(matches!(read(raw, 1 << 20), Err(ReadError::Reject(413, _))));
-        // 上限内でも、宣言より短く切れたら EOF(先に確保しないので落ちない)
+        // Even within the limit, a body cut shorter than declared is EOF (nothing is allocated up front, so no crash)
         let raw = b"POST / HTTP/1.1\r\nContent-Length: 100\r\n\r\nabc";
         assert!(matches!(read(raw, 1 << 20), Err(ReadError::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof));
     }

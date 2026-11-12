@@ -1,18 +1,18 @@
-# cargo-deny の設定。CI(.github/workflows/security.yml)と手元の `cargo deny check` の両方が読む。
-# 依存を増やすときにここで止まったら、理由を確かめてから許可を足す。黙って緩めない。
+# cargo-deny configuration. Read by both CI (.github/workflows/security.yml) and a local `cargo deny check`.
+# If adding a dependency stops here, check the reason before adding an allowance. Do not loosen it silently.
 
 [graph]
-# feature "sqlite" を外したビルドも出すので、どちらの依存も検査する
+# A build without the "sqlite" feature is also shipped, so check the dependencies of both
 all-features = true
 
 [advisories]
-# RustSec のアドバイザリデータベースと照合する。脆弱性・取り下げ(yanked)・保守終了は既定で落ちる。
-# 例外を足すときは、理由と見直す期日をコメントに書く
+# Checks against the RustSec advisory database. Vulnerabilities, yanked versions, and unmaintained crates fail by
+# default. When adding an exception, write the reason and a review date in a comment
 ignore = []
 
 [licenses]
-# 実際の依存が使っているものだけを許す(2026-11-12 時点)。新しいライセンスの依存が入ったら、
-# ここで落ちるので、配布の条件と両立するかを確かめてから足す
+# Allows only the licenses the actual dependencies use (as of 2026-11-12). A dependency with a new license fails
+# here, so check that it is compatible with the distribution terms before adding it
 allow = [
     "MIT",
     "Apache-2.0",
@@ -20,19 +20,19 @@ allow = [
     "BSD-3-Clause",
     "Unicode-3.0",
     "Zlib",
-    # webpki-roots が同梱するルート証明書のデータ(Mozilla の CA 一覧を由来とする)
+    # Root certificate data bundled by webpki-roots (derived from Mozilla's CA list)
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
 [bans]
 multiple-versions = "warn"
-# バージョンを "*" で指定した依存は、何が入るか決まらないので禁止する
+# Dependencies with version "*" are forbidden, because what gets pulled in is not determined
 wildcards = "deny"
 
 [sources]
-# crates.io 以外(ほかのレジストリ、git リポジトリ)からの依存を禁止する。
-# 取得元を差し替える型のサプライチェーン攻撃を、依存を足す段階で止めるため
+# Forbids dependencies from anywhere other than crates.io (other registries, git repositories).
+# This stops supply chain attacks that swap the source at the point where a dependency is added
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

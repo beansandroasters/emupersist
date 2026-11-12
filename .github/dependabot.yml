@@ -1,6 +1,7 @@
-# 依存とアクションの更新を PR で提案させる。
-# 公開から 7 日待ってから提案する(cooldown)。公開直後の版は、侵害された版が届くときの典型的な形なので。
-# セキュリティ更新(既知の脆弱性の修正)にはこの待ちは掛からない(Dependabot の仕様)。
+# Has Dependabot propose dependency and action updates as PRs.
+# Proposals wait 7 days after publication (cooldown), because a freshly published version is the typical way a
+# compromised version arrives.
+# Security updates (fixes for known vulnerabilities) are not subject to this wait (Dependabot behavior).
 version: 2
 updates:
   - package-ecosystem: cargo

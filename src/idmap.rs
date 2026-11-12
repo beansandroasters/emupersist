@@ -1,20 +1,23 @@
-//! リプレイで変わってしまう ID を、クライアントから見て変わらないように見せる。
+//! Makes IDs that change on replay look unchanged from the client's point of view.
 //!
-//! 記録には応答も残しておき、リプレイで得た応答と構造を揃えて比べる。同じ位置にあって値だけが違う文字列を
-//! 「記録時の ID → 今の ID」の対応として覚える。以後は、エミュレータへ送る要求を今の ID に書き換え、
-//! 応答を記録時の ID に書き戻す。ジャーナルにはクライアント側の ID で書くので、再起動を何回またいでも
-//! クライアントにとっての ID は最初に見たものから変わらない。
+//! Records also keep the response, and the response obtained on replay is aligned by structure and compared with it.
+//! Strings at the same position whose values differ are remembered as a "recorded ID -> current ID" mapping. From then
+//! on, requests sent to the emulator are rewritten to the current IDs, and responses are rewritten back to the
+//! recorded IDs. The journal is written with the client-side IDs, so however many restarts pass, the IDs the client
+//! sees stay the ones it saw first.
 //!
-//! 書き換えるのは、パス・ヘッダ・テキスト系の本文(JSON / XML / フォーム)だけ。S3 のオブジェクト本文には、
-//! content-type が JSON でも触らない(利用者のデータであり、チェックサムで守られているため)。
-//! 本文を書き換えたときは、本文に結びついた整合性ヘッダ(x-amz-crc32、Content-MD5、x-amz-checksum-*、
-//! x-amz-content-sha256)を計算し直す。
+//! Only paths, headers, and text bodies (JSON / XML / form) are rewritten. S3 object bodies are never touched, even
+//! when the content-type is JSON (they are the user's data and are protected by checksums).
+//! When a body is rewritten, the integrity headers tied to the body (x-amz-crc32, Content-MD5, x-amz-checksum-*,
+//! x-amz-content-sha256) are recomputed.
 //!
-//! 何を ID とみなすかは推測で、外れるのは避けられない。状態値(`PENDING` → `RUNNING`)のように毎回
-//! 変わるのが正しい値を覚えると、無関係な要求まで書き換えてしまう。そこで次のものは覚えない。
-//! - 時刻・数値・真偽値・HTTP 日付・6文字未満の値
-//! - 数字も `:` `/` も含まず、大文字と小文字が語の途中で混ざってもいない値(英単語や列挙値)
-//! - 名前が RequestId・Token・Status・State・Message などで終わる項目
+//! What counts as an ID is a guess, and misses are unavoidable. Remembering values that are supposed to change every
+//! time, such as states (`PENDING` -> `RUNNING`), would rewrite unrelated requests too. So the following are not
+//! remembered:
+//! - Times, numbers, booleans, HTTP dates, and values shorter than 6 characters
+//! - Values that contain no digit, no `:`, and no `/`, and do not mix upper and lower case within a word (English
+//!   words and enum values)
+//! - Fields whose names end in RequestId, Token, Status, State, Message, and so on
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
@@ -42,7 +45,7 @@ const SKIP_HEADERS: &[&str] = &[
     "expires",
 ];
 const MIN_LEN: usize = 6;
-/// 項目名がこれで終わるものは、値が変わっても ID ではない(大文字小文字は区別しない)
+/// Fields whose names end with one of these are not IDs even when the value changes (case-insensitive)
 const NOT_ID_KEYS: &[&str] = &[
     "requestid",
     "token",
@@ -59,8 +62,9 @@ const NOT_ID_KEYS: &[&str] = &[
     "marker",
     "signature",
 ];
-/// S3 の設定系サブリソース。この付いた要求・応答の本文はバケットの設定(XML / JSON)で、ID が載りうる。
-/// これが付かない S3 の要求・応答の本文はオブジェクトのデータなので、書き換えない
+/// S3 configuration subresources. Bodies of requests and responses with one of these are bucket configuration
+/// (XML / JSON) and may contain IDs. Bodies of S3 requests and responses without one are object data, so they are not
+/// rewritten
 const S3_CONFIG_SUBRESOURCES: &[&str] = &[
     "accelerate",
     "acl",
@@ -91,7 +95,7 @@ pub fn is_text(content_type: Option<&str>) -> bool {
     })
 }
 
-/// 署名の資格情報スコープ(`<akid>/<日付>/<リージョン>/<サービス>/aws4_request`)からサービス名を取る。
+/// Takes the service name from the signature's credential scope (`<akid>/<date>/<region>/<service>/aws4_request`).
 fn signing_service(target: &str, headers: &Headers) -> Option<String> {
     let scope = header(headers, "authorization")
         .and_then(|a| a.split("Credential=").nth(1))
@@ -104,7 +108,7 @@ fn signing_service(target: &str, headers: &Headers) -> Option<String> {
     scope.split('/').nth(3).map(str::to_string)
 }
 
-/// この要求(とその応答)の本文が、S3 のオブジェクトのデータか。
+/// Whether the body of this request (and its response) is S3 object data.
 fn is_s3_object_body(target: &str, headers: &Headers) -> bool {
     let s3 = signing_service(target, headers).is_some_and(|s| s.starts_with("s3"));
     if !s3 {
@@ -120,12 +124,13 @@ fn has_mid_word_case_mix(s: &str) -> bool {
     chars.any(|c| c.is_ascii_uppercase()) && s.chars().any(|c| c.is_ascii_lowercase())
 }
 
-/// ID らしい値か。次のどれかに当たるものを ID とみなす。
-/// - 数字・`:`・`/` のどれかを含む
-/// - 大文字と小文字が語の途中で混ざっている(`gZHOzH`)
-/// - 16 文字以上の英数字だけでできている(IAM のアクセスキー。乱数次第で数字を含まないことがある)
+/// Whether a value looks like an ID. A value is treated as an ID if any of the following holds:
+/// - It contains a digit, `:`, or `/`
+/// - It mixes upper and lower case within a word (`gZHOzH`)
+/// - It is 16 or more characters of only ASCII letters and digits (IAM access keys, which depending on the random
+///   draw may contain no digit)
 ///
-/// `PENDING`・`available`・`Running`・`CREATE_IN_PROGRESS` のような英単語や列挙値は外れる。
+/// English words and enum values such as `PENDING`, `available`, `Running`, and `CREATE_IN_PROGRESS` are excluded.
 fn looks_like_id(s: &str) -> bool {
     s.chars().any(|c| c.is_ascii_digit() || c == ':' || c == '/')
         || has_mid_word_case_mix(s)
@@ -133,13 +138,14 @@ fn looks_like_id(s: &str) -> bool {
 }
 
 fn key_is_not_id(path: &str) -> bool {
-    // パスの最後の要素(`/A/B[0]` の `B`、XML の名前空間接頭辞は外す)
+    // The last element of the path (`B` in `/A/B[0]`, with any XML namespace prefix removed)
     let last = path.rsplit('/').next().unwrap_or("");
     let name = last.split('[').next().unwrap_or("").rsplit(':').next().unwrap_or("").to_ascii_lowercase();
     NOT_ID_KEYS.iter().any(|k| name.ends_with(k))
 }
 
-/// 値が違っても ID ではないもの(時刻・数値・真偽値・HTTP 日付)。毎回変わるのが正しい。
+/// Values that are not IDs even when they differ (times, numbers, booleans, HTTP dates). They are expected to change
+/// every time.
 fn not_id(s: &str) -> bool {
     let b = s.as_bytes();
     let d = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
@@ -203,7 +209,8 @@ fn json_leaves(v: &Value, path: String, out: &mut BTreeMap<String, String>) {
     }
 }
 
-/// XML を「要素の位置 → 葉要素の文字列」に平らにする。宣言・コメントは飛ばし、CDATA は文字列として読む。
+/// Flattens XML into "element position -> leaf element text". Skips declarations and comments, and reads CDATA as
+/// text.
 fn xml_leaves(text: &str) -> Option<BTreeMap<String, String>> {
     struct Frame {
         path: String,
@@ -274,11 +281,12 @@ fn leaves(body: &[u8], content_type: &str) -> Option<BTreeMap<String, String>> {
     }
 }
 
-/// 一方向の置換表。長いキーから順に当てる(ARN の中のキー ID より ARN 全体を先に当てる)。
+/// A one-way replacement table. Longer keys are matched first (a whole ARN is matched before the key ID inside it).
 #[derive(Default)]
 struct Table {
     map: HashMap<String, String>,
-    /// 先頭バイト → (キー, 置換後) を長い順に。URL エンコードした形も入れる。足すたびに差分で更新する
+    /// First byte -> (key, replacement), longest first. Also holds the URL-encoded forms. Updated incrementally on
+    /// each insert
     index: HashMap<u8, Vec<(String, String)>>,
 }
 
@@ -324,13 +332,14 @@ impl Table {
     }
 }
 
-/// 本文を書き換えたあと、本文に結びついた整合性ヘッダを付け直す。知らない形式のチェックサムは外す。
+/// After a body is rewritten, recomputes the integrity headers tied to the body. Removes checksums of unknown
+/// algorithms.
 fn refresh_integrity(headers: &mut Headers, body: &[u8]) {
     let sha = |alg: &'static digest::Algorithm| digest::digest(alg, body).as_ref().to_vec();
     headers.retain_mut(|(k, v)| {
         let lk = k.to_ascii_lowercase();
         match lk.as_str() {
-            "x-amz-crc32" => *v = crc32(body).to_string(), // DynamoDB の応答。SDK が照合する
+            "x-amz-crc32" => *v = crc32(body).to_string(), // DynamoDB responses. The SDK checks it
             "content-md5" => *v = b64encode(&md5(body)),
             "x-amz-content-sha256" if v.len() == 64 => *v = hex(&sha(&digest::SHA256)),
             "x-amz-checksum-crc32" => *v = b64encode(&crc32(body).to_be_bytes()),
@@ -347,7 +356,7 @@ fn refresh_integrity(headers: &mut Headers, body: &[u8]) {
 
 #[derive(Default)]
 pub struct IdMap {
-    inner: RwLock<(Table, Table)>, // (記録時 → 今, 今 → 記録時)
+    inner: RwLock<(Table, Table)>, // (recorded -> current, current -> recorded)
 }
 
 impl IdMap {
@@ -359,7 +368,7 @@ impl IdMap {
         self.len() == 0
     }
 
-    /// 記録時の応答と今の応答を比べて対応を足す。足した数を返す。
+    /// Compares the recorded response with the current one and adds mappings. Returns the number added.
     pub fn learn(&self, old_headers: &Headers, old_body: &[u8], new_headers: &Headers, new_body: &[u8]) -> usize {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (k, v) in old_headers {
@@ -379,8 +388,9 @@ impl IdMap {
                 );
             }
         }
-        // 短い値から学ぶ。キー ID を先に覚えれば、それを含む ARN は「説明できる」ので足さずに済む。
-        // 本文の並び順に頼ると、ARN が先に来たときに冗長な対応が増える
+        // Learn from shorter values first. Once the key ID is known, an ARN containing it is already explained, so
+        // it does not need to be added. Relying on the order in the body adds redundant mappings when the ARN
+        // comes first
         pairs.sort_by_key(|(old, _)| old.len());
         let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let mut added = 0;
@@ -388,7 +398,7 @@ impl IdMap {
             if old == now || old.chars().count() < MIN_LEN || not_id(&old) || not_id(&now) || !looks_like_id(&old) {
                 continue;
             }
-            // すでに覚えている対応で説明できるなら足さない(ARN の中のキー ID など)
+            // Do not add it if existing mappings already explain it (such as the key ID inside an ARN)
             if g.0.apply(&old) == now {
                 continue;
             }
@@ -416,7 +426,7 @@ impl IdMap {
         (hs, body.to_vec())
     }
 
-    /// クライアントの要求を、エミュレータへ送る形に書き換える(記録時の ID → 今の ID)。
+    /// Rewrites a client request into the form sent to the emulator (recorded ID -> current ID).
     pub fn to_emulator(
         &self,
         _method: &str,
@@ -429,8 +439,8 @@ impl IdMap {
         (g.0.apply(target), h, b)
     }
 
-    /// エミュレータの応答を、クライアントに返す形に書き戻す(今の ID → 記録時の ID)。
-    /// `target` と `req_headers` は元の要求のもの(S3 のオブジェクト本文かどうかを決めるのに使う)。
+    /// Rewrites an emulator response back into the form returned to the client (current ID -> recorded ID).
+    /// `target` and `req_headers` come from the original request (used to decide whether the body is S3 object data).
     pub fn to_client(
         &self,
         _method: &str,
@@ -579,7 +589,7 @@ mod tests {
         let (_, hs, b) = m.to_emulator("PUT", "/bkt?encryption", &s3("application/xml"), body);
         assert!(String::from_utf8(b.clone()).unwrap().contains("key-2222"), "設定の本文は書き換える");
         assert_eq!(header(&hs, "content-md5"), Some(b64encode(&md5(&b)).as_str()), "Content-MD5 を付け直す");
-        // 署名つき URL(クエリの X-Amz-Credential)でも S3 と見分ける
+        // S3 is recognized from a presigned URL as well (X-Amz-Credential in the query)
         let q = "/bkt/a.json?X-Amz-Credential=AKIA%2F20261112%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=0";
         assert_eq!(m.to_emulator("PUT", q, &j, br#"{"k":"key-1111"}"#).2, br#"{"k":"key-1111"}"#);
     }

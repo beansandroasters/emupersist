@@ -1,14 +1,14 @@
-# 依存とコードのセキュリティ検査。GitHub Actions の中だけで完結し、外部の SaaS には送らない。
+# Security checks for dependencies and code. Runs entirely inside GitHub Actions and sends nothing to external SaaS.
 #
-# この CI そのものが攻撃の入口にならないよう、次を守っている(変えるときは理由を残す)。
-# - アクションは GitHub 公式のもの(actions/*, github/*)だけを使い、タグではなくコミット SHA で固定する。
-#   タグは後から付け替えられる(2025 年の tj-actions/changed-files の侵害では、既存のタグが
-#   悪意あるコミットに向け直された)。更新は Dependabot の PR で、SHA の差分として見る
-# - GITHUB_TOKEN の権限は既定ですべて外し、ジョブごとに必要な分だけ足す
-# - pull_request_target は使わない(フォークからの PR に、書き込み権限と秘密情報を渡さないため)
-# - checkout は認証情報を作業ツリーに残さない(persist-credentials: false)
-# - キャッシュは使わない(別のジョブが汚したキャッシュを読み込まないため。実行時間と引き換え)
-# - ツールはバージョンを固定し、依存も --locked で固定して入れる
+# To keep this CI itself from becoming an attack vector, it follows these rules (record the reason when changing them).
+# - Uses only official GitHub actions (actions/*, github/*), pinned to a commit SHA rather than a tag.
+#   Tags can be moved later (in the 2025 tj-actions/changed-files compromise, existing tags were
+#   repointed to malicious commits). Updates arrive as Dependabot PRs and are reviewed as SHA diffs
+# - Removes all GITHUB_TOKEN permissions by default and adds only what each job needs
+# - Does not use pull_request_target (so PRs from forks get no write permissions or secrets)
+# - checkout does not leave credentials in the working tree (persist-credentials: false)
+# - Does not use caches (so a cache poisoned by another job is never loaded; costs run time)
+# - Pins tool versions and installs their dependencies pinned with --locked
 
 name: security
 
@@ -17,7 +17,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # 依存に変更がなくても、新しく公開されたアドバイザリを拾うため毎週回す(月曜 03:17 UTC)
+    # Runs weekly to pick up newly published advisories even when dependencies do not change (Mondays 03:17 UTC)
     - cron: "17 3 * * 1"
   workflow_dispatch:
 
@@ -39,10 +39,10 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-deny
-        # crates.io から、cargo-deny 自身の Cargo.lock どおりの依存でビルドする
+        # Builds from crates.io with the dependencies in cargo-deny's own Cargo.lock
         run: cargo install --locked cargo-deny --version 0.20.2
       - name: cargo deny check
-        # 設定は deny.toml。Cargo.lock と食い違うときは落とす(--locked)
+        # Configured in deny.toml. Fails if it disagrees with Cargo.lock (--locked)
         run: cargo deny --locked check
 
   codeql:
@@ -51,11 +51,12 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      security-events: write # 結果を Code scanning に上げる
+      security-events: write # Uploads results to Code scanning
     strategy:
       fail-fast: false
       matrix:
-        # rust: このクレートのコード / actions: このディレクトリのワークフロー自体(式の注入、権限の広げすぎなど)
+        # rust: this crate's code / actions: the workflows in this directory themselves (expression injection,
+        # overly broad permissions, and so on)
         language: [rust, actions]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

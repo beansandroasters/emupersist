@@ -1,11 +1,12 @@
-//! クライアントとエミュレータのあいだに立つ HTTP プロキシ。
+//! An HTTP proxy that sits between the client and the emulator.
 //!
-//! 状態を変える要求のうち 2xx で終わったものを、受け取った形のままジャーナルに追記する。
-//! 起動時にジャーナルを先頭から同じ順で流し直すと、エミュレータの状態が戻る(イベントソーシング)。
+//! State-changing requests that finish with 2xx are appended to the journal exactly as received.
+//! Replaying the journal from the start in the same order at startup restores the emulator state (event sourcing).
 //!
-//! エミュレータは `-a off`(署名検証なし)で動かす前提。資格情報は起動のたびに変わるので、
-//! 記録した署名は再起動後には通らない。`-a off` ならリージョンとアカウントは Authorization ヘッダの
-//! 資格情報スコープから読まれ、署名そのものは見られない。だから記録には署名を伏せた Authorization を残す。
+//! The emulator is assumed to run with `-a off` (no signature verification). Credentials change on every start, so
+//! recorded signatures do not pass after a restart. With `-a off`, the region and account are read from the
+//! credential scope in the Authorization header and the signature itself is not checked. So records keep the
+//! Authorization header with the signature redacted.
 
 use std::collections::HashSet;
 use std::io::{BufReader, BufWriter};
@@ -23,10 +24,10 @@ use crate::stores::{seq_of, Store};
 use crate::util::{b64decode, b64encode, now_f64};
 
 pub const ADMIN_PREFIX: &str = "/__persist/";
-/// 応答はこの大きさまで記録する(ID の対応づけに使う)。大きい応答に ID が載ることはまずない。
+/// Responses up to this size are recorded (used for ID mapping). Large responses rarely carry IDs.
 const MAX_RECORDED_RESPONSE: usize = 1 << 20;
 
-/// Authorization の `Signature=<16進>` を伏せる。
+/// Redacts `Signature=<hex>` in Authorization.
 fn redact_signature(v: &str) -> String {
     match v.find("Signature=") {
         Some(i) => {
@@ -42,7 +43,7 @@ fn redact_signature(v: &str) -> String {
     }
 }
 
-/// クエリの X-Amz-Signature / X-Amz-Security-Token(署名つき URL)を伏せる。
+/// Redacts X-Amz-Signature / X-Amz-Security-Token in the query (presigned URLs).
 fn redact_query(path: &str) -> String {
     let Some((p, q)) = path.split_once('?') else { return path.to_string() };
     let q: Vec<String> = q
@@ -81,12 +82,12 @@ fn summary(rec: &Value) -> Value {
 
 pub struct Journal {
     pub store: Box<dyn Store>,
-    inner: Mutex<(u64, Vec<Value>)>, // (次の連番, 一覧表示用の要約)
+    inner: Mutex<(u64, Vec<Value>)>, // (next sequence number, summaries for listing)
     pub emulator_version: Option<String>,
 }
 
 impl Journal {
-    /// 保存先を読み、本文つきの全レコード(リプレイ用)と一緒に返す。
+    /// Reads the store and returns the journal together with all records including bodies (for replay).
     pub fn open(store: Box<dyn Store>) -> Result<(Self, Vec<Value>), String> {
         let loaded = store.read_all().map_err(|e| e.to_string())?;
         let next = loaded.last().map_or(1, |r| seq_of(r) + 1);
@@ -140,9 +141,10 @@ impl Journal {
             rec["rheaders"] = headers_to_json(&rh);
             rec["rbody"] = json!(b64encode(rbody));
         }
-        // 失敗しても連番は進める。保存先によっては、失敗に見えても一部が書けていることがある
-        // (DynamoDB の分割レコードの一部、応答だけ失われた S3 の PUT)。同じ連番に書き直すと、
-        // それに当たって Conflict が出続ける。飛んだ連番は読み込み時に問題にならない
+        // Advance the sequence number even on failure. Depending on the store, part of a write may have landed even
+        // when it looks failed (part of a split DynamoDB record, an S3 PUT whose response alone was lost). Rewriting
+        // the same sequence number would hit it and keep failing with Conflict. Skipped sequence numbers cause no
+        // problem when loading
         g.0 = seq + 1;
         self.store.append(&rec).map_err(|e| e.to_string())?;
         g.1.push(summary(&rec));
@@ -164,17 +166,19 @@ fn op_label(rec: &Value) -> String {
     }
 }
 
-/// SIGTERM / SIGINT を受けたら立つ。リプレイの途中でも止まり、子のエミュレータを片付けてから終わるため。
+/// Set on SIGTERM / SIGINT, so the proxy stops even in the middle of replay and exits after cleaning up the child
+/// emulator.
 pub static STOP: AtomicBool = AtomicBool::new(false);
 
-/// 記録を順に流す。最後まで 2xx にならなかった件数を返す。
+/// Replays the records in order. Returns the number that never reached 2xx.
 ///
-/// エミュレータは非同期の状態遷移も再現する(DynamoDB の CreateTable 直後は CREATING で、続く PutItem は
-/// ResourceNotFoundException になる)。リプレイは間を詰めて流すので、同じ遷移の途中に当たる。そこで、
-/// 記録時に成功していて今回失敗したものは、間隔を伸ばしながら送り直す。失敗した要求は状態を変えていない
-/// ので、二重には適用されない。送り直しに使う時間は、リプレイ全体の合計で `retry_budget` まで
-/// (版が変わって大量に食い違うときに、1件ごとに待って起動が何十分も止まらないため)。
-/// 成功したら、記録時と今回の応答を比べて ID の対応を覚える。
+/// The emulator also reproduces asynchronous state transitions (right after DynamoDB CreateTable the table is
+/// CREATING, and a following PutItem gets ResourceNotFoundException). Replay sends requests back to back, so it
+/// lands in the middle of such transitions. So requests that succeeded when recorded but fail now are resent with
+/// growing intervals. A failed request did not change state, so nothing is applied twice. The time spent on resends
+/// is capped at `retry_budget` in total for the whole replay (so that when a version change causes many mismatches,
+/// waiting on each one does not stall startup for tens of minutes).
+/// On success, the recorded and current responses are compared to learn ID mappings.
 pub fn replay(upstream: &Client, records: &[Value], idmap: &IdMap, retry_budget: Duration) -> Result<usize, String> {
     let (mut failed, mut retried) = (0, 0);
     let t0 = Instant::now();
@@ -188,7 +192,7 @@ pub fn replay(upstream: &Client, records: &[Value], idmap: &IdMap, retry_budget:
         let headers = headers_from_json(&rec["headers"]);
         let mut wait = Duration::from_millis(50);
         let resp = loop {
-            // 対応表は前のレコードで育つので、送るたびに書き換え直す
+            // The mapping table grows with earlier records, so rewrite again on every send
             let (path, h, b) = idmap.to_emulator(method, rec["path"].as_str().unwrap_or("/"), &headers, &body);
             let resp = upstream.send(method, &path, &h, &b).map_err(|e| format!("エミュレータに届かない: {e}"))?;
             if (200..300).contains(&resp.status) || spent + wait > retry_budget || STOP.load(Ordering::SeqCst) {
@@ -226,17 +230,19 @@ pub fn replay(upstream: &Client, records: &[Value], idmap: &IdMap, retry_budget:
 
 pub type ResetFn = Box<dyn Fn() -> Result<Client, String> + Send + Sync>;
 
-/// ブラウザ経由の攻撃を防ぐための規則。
+/// Rules that block attacks through a browser.
 ///
-/// 後段は署名を検証しない(`-a off`)。127.0.0.1 で待ち受けていても、利用者のブラウザが悪意あるページを
-/// 開けば、そのページから http://127.0.0.1:4566 にフォームを POST できる(CSRF)。DNS を差し替えて
-/// 同一オリジンに見せかけることもできる(DNS rebinding)。そこで次の2つを断る。
-/// - `Origin` ヘッダつきの要求(ブラウザは別オリジンへの POST や fetch に必ず付ける)。`--allow-origin` で許す
-/// - `Host` がループバック(127.0.0.1 / localhost / ::1)でも待ち受けアドレスでもない要求(DNS rebinding)。
-///   0.0.0.0 などで待ち受けているときは、どの名前で届くか決められないので見ない
+/// The backend does not verify signatures (`-a off`). Even when listening on 127.0.0.1, if the user's browser opens
+/// a malicious page, that page can POST a form to http://127.0.0.1:4566 (CSRF). It can also swap DNS to look
+/// same-origin (DNS rebinding). So the following two are rejected:
+/// - Requests with an `Origin` header (browsers always send it on cross-origin POST and fetch). Allowed with
+///   `--allow-origin`
+/// - Requests whose `Host` is neither loopback (127.0.0.1 / localhost / ::1) nor the listen address (DNS rebinding).
+///   When listening on 0.0.0.0 or similar, the name requests arrive under cannot be determined, so Host is not
+///   checked
 pub struct BrowserGuard {
     pub allow_origins: Vec<String>,
-    /// None なら Host を見ない
+    /// If None, Host is not checked
     pub allowed_hosts: Option<Vec<String>>,
 }
 
@@ -272,14 +278,15 @@ impl BrowserGuard {
 
 pub struct Proxy {
     pub journal: Journal,
-    /// エミュレータと対応表は reset で丸ごと差し替える
+    /// The emulator and the mapping table are replaced as a whole on reset
     pub state: RwLock<(Arc<Client>, Arc<IdMap>)>,
-    /// 要求の処理(エミュレータへの送信から記録まで)は read、reset は write で取る。
-    /// reset の途中に古いエミュレータで成功した書き込みが、消したばかりのジャーナルに混ざらないため
+    /// Request handling (from sending to the emulator through recording) takes it for read, and reset takes it for
+    /// write. This keeps writes that succeeded on the old emulator during a reset out of the journal just cleared
     pub gate: RwLock<()>,
-    /// 書き込み系のリクエストは、エミュレータへの送信から記録までをこのロックの中で1本ずつ行う。
-    /// 並行に通すと、記録の順(レスポンスが返った順)がエミュレータの適用した順とずれ、同じ項目を同時に
-    /// 書き換えたときに、リプレイで最後に残る値が入れ替わる(実測: 8 クライアントで 20 回中 14 回)
+    /// Write requests go one at a time inside this lock, from sending to the emulator through recording.
+    /// If they ran concurrently, the recording order (the order responses came back) would drift from the order the
+    /// emulator applied them, and when the same item is updated concurrently, the value left last after replay would
+    /// be swapped (measured: 14 of 20 trials with 8 clients)
     pub write_lock: Mutex<()>,
     pub extra_writes: HashSet<String>,
     pub extra_reads: HashSet<String>,
@@ -291,9 +298,10 @@ pub struct Proxy {
     pub connections: AtomicUsize,
 }
 
-/// 同時接続の上限。1接続1スレッドなので、外に開いたときにスレッドを使い切られないようにする
+/// The limit on concurrent connections. Each connection gets one thread, so this keeps threads from being exhausted
+/// when the proxy is exposed externally
 const MAX_CONNECTIONS: usize = 512;
-/// クライアントが何も送らずに接続を保っていられる時間
+/// How long a client can keep a connection open without sending anything
 const CLIENT_IDLE: Duration = Duration::from_secs(300);
 
 fn json_response(status: u16, v: &Value) -> Response {
@@ -317,7 +325,7 @@ impl Proxy {
             );
         };
         let _g = self.gate.write().unwrap_or_else(|e| e.into_inner());
-        // 先にエミュレータを作り直す。失敗したらジャーナルは消さない(次の起動で元に戻せるように)
+        // Recreate the emulator first. If that fails, do not clear the journal (so the next start can restore it)
         let client = match reset() {
             Ok(c) => c,
             Err(e) => {
@@ -363,8 +371,9 @@ impl Proxy {
         let _g = self.gate.read().unwrap_or_else(|e| e.into_inner());
         let op = classify::operation_name(&req.method, &req.target, &req.headers, &req.body);
         let mut mutating = classify::is_mutating(&req.method, op.as_deref(), &self.extra_writes, &self.extra_reads);
-        // SQS の ReceiveMessage はロングポーリングで最大 20 秒待つので、順番待ちに入れるとほかの書き込みが
-        // 止まる。受信どうし・受信と送信の順は、リプレイ後の状態への影響が小さいので外す
+        // SQS ReceiveMessage waits up to 20 seconds with long polling, so queuing it would block other writes. The
+        // order among receives, and between receives and sends, has little effect on the state after replay, so it
+        // is left out
         let _w = (mutating && op.as_deref() != Some("ReceiveMessage"))
             .then(|| self.write_lock.lock().unwrap_or_else(|e| e.into_inner()));
         let (upstream, idmap) = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
@@ -375,10 +384,10 @@ impl Proxy {
         };
         let (rh, rb) = idmap.to_client(&req.method, &req.target, &req.headers, &resp.headers, &resp.body);
         if mutating && op.as_deref() == Some("ReceiveMessage") && !rb.windows(13).any(|w| w == b"ReceiptHandle") {
-            mutating = false; // 空振りの受信は状態を変えない。ポーリングでジャーナルが伸びるのを防ぐ
+            mutating = false; // An empty receive does not change state. Keeps polling from growing the journal
         }
         if mutating && (200..300).contains(&resp.status) {
-            // クライアントが送ったまま・受け取ったままの形で書く(ID は記録時の側に揃う)
+            // Write exactly what the client sent and received (IDs stay on the recorded side)
             if let Err(e) = self.journal.append(
                 &req.method,
                 &req.target,
@@ -389,8 +398,8 @@ impl Proxy {
                 &rh,
                 &rb,
             ) {
-                // エミュレータの状態は変わったのに記録できなかった。成功を返すと、再起動後に黙って状態が欠ける。
-                // だから失敗として返し、状態にも残す
+                // The emulator state changed but could not be recorded. Returning success would silently lose state
+                // after a restart. So return a failure and also record it in the degraded status
                 crate::log!("記録に失敗した({}): {e}", op.as_deref().unwrap_or(&req.method));
                 self.set_degraded(e.clone());
                 return json_response(
@@ -414,7 +423,7 @@ impl Proxy {
                 Ok(Some(r)) => r,
                 Ok(None) | Err(ReadError::Io(_)) => return,
                 Err(ReadError::Reject(status, msg)) => {
-                    // 本文を読み切っていないので、この接続はもう使えない。理由を返して閉じる
+                    // The body was not fully read, so this connection is no longer usable. Send the reason and close
                     let resp = json_response(status, &json!({"error": msg}));
                     let _ = http::write_response(&mut writer, &resp, false, true);
                     return;
@@ -427,7 +436,8 @@ impl Proxy {
         }
     }
 
-    /// 1接続1スレッドで待ち受ける。開発用の道具なので、同時接続はスレッドで足りる(上限 MAX_CONNECTIONS)。
+    /// Listens with one thread per connection. This is a development tool, so threads are enough for concurrent
+    /// connections (up to MAX_CONNECTIONS).
     pub fn serve(self: Arc<Self>, listener: TcpListener) {
         for mut stream in listener.incoming().flatten() {
             if self.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {

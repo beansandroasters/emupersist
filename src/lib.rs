@@ -1,4 +1,4 @@
-//! AWS Emulator の状態を、リクエストのジャーナルで永続化する。
+//! Persists AWS Emulator state with a journal of requests.
 
 pub mod aws;
 pub mod classify;

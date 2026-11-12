@@ -1,16 +1,16 @@
-//! リクエストが状態を変えるかどうかを、エミュレータの中を見ずに判定する。
+//! Decides whether a request changes state, without looking inside the emulator.
 //!
-//! RPC 系(awsJson / awsQuery / Smithy RPCv2)は操作名の接頭辞で、REST 系は HTTP メソッドで判断する。
-//! 迷ったら「書き込み」に倒す。読み取りを記録してもリプレイが少し遅くなるだけだが、
-//! 書き込みを落とすと状態が欠ける。
+//! RPC protocols (awsJson / awsQuery / Smithy RPCv2) are judged by the operation name prefix, REST protocols by the
+//! HTTP method. When in doubt, it treats the request as a write. Recording a read only makes replay a little slower,
+//! but dropping a write loses state.
 
 use std::collections::HashSet;
 
 use crate::http::{header, Headers};
 
-/// 状態を変えない操作の接頭辞。次のものは、名前に反して状態を変えるので入れていない。
-/// Verify*(SES の VerifyEmailIdentity は ID を作る)、Detect*(DetectStackDrift は結果を残す)、
-/// Export*(DynamoDB のエクスポートはリソースになる)、Check*(CheckoutLicense)、Sign*(SignUp)。
+/// Prefixes of operations that do not change state. The following are left out because, despite their names, they
+/// change state: Verify* (SES VerifyEmailIdentity creates an identity), Detect* (DetectStackDrift keeps a result),
+/// Export* (a DynamoDB export becomes a resource), Check* (CheckoutLicense), Sign* (SignUp).
 const READ_PREFIXES: &[&str] = &[
     "Describe",
     "List",
@@ -34,13 +34,13 @@ const READ_PREFIXES: &[&str] = &[
     "Count",
 ];
 
-/// 接頭辞にすると書き込み操作まで巻き込むので、完全一致で読み取りとみなす操作。
-/// `Sign` を接頭辞にすると Cognito の `SignUp` が、`Check` を接頭辞にすると License Manager の
-/// `CheckoutLicense` が記録されなくなる(ユーザー登録が再起動で消える)。
+/// Operations treated as reads only on an exact match, because as prefixes they would also catch write operations.
+/// With `Sign` as a prefix, Cognito `SignUp` would not be recorded, and with `Check` as a prefix, License Manager
+/// `CheckoutLicense` would not be recorded (user sign-ups would disappear on restart).
 const READ_EXACT: &[&str] =
     &["Sign", "Encrypt", "VerifyMac", "CheckDomainAvailability", "CheckIfPhoneNumberIsOptedOut"];
 
-/// 接頭辞は読み取り系に見えるが、資格情報や ID を発行する操作。
+/// Operations whose prefix looks like a read but which issue credentials or IDs.
 const WRITE_OVERRIDES: &[&str] = &[
     "GetSessionToken",
     "GetFederationToken",
@@ -57,7 +57,7 @@ fn query_param(query: &str, name: &str) -> Option<String> {
     })
 }
 
-/// RPC 系なら操作名を返す。REST 系(操作名がない)なら None。
+/// Returns the operation name for RPC protocols. Returns None for REST protocols (which have no operation name).
 pub fn operation_name(method: &str, target: &str, headers: &Headers, body: &[u8]) -> Option<String> {
     if let Some(t) = header(headers, "x-amz-target") {
         return Some(t.rsplit('.').next().unwrap_or(t).to_string());

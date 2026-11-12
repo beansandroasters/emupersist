@@ -1,7 +1,7 @@
-//! aws-emulator を子プロセスとして起動・停止する(監督モード)。
+//! Starts and stops aws-emulator as a child process (supervised mode).
 //!
-//! ポートは `-p 0` で OS に選ばせる。実際のエンドポイントと CA ファイルの場所は、
-//! エミュレータが起動時に出す JSON ログの "emulator server information" 行から読む。
+//! The OS picks the port via `-p 0`. The actual endpoint and the CA file location are read from the
+//! "emulator server information" line of the JSON log that the emulator prints at startup.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -14,9 +14,9 @@ use crate::http::Client;
 
 type SpawnJob = (Command, mpsc::Sender<std::io::Result<Child>>);
 
-/// 子プロセスを、プロセスが終わるまで生き続ける専用スレッドで起動する。
-/// reset は接続ごとのスレッドから呼ばれるので、そこで fork すると、接続が閉じた時点で
-/// PDEATHSIG が子に届いてしまう。
+/// Spawns the child process on a dedicated thread that lives until the process exits.
+/// reset is called from per-connection threads, so forking there would deliver PDEATHSIG to the child
+/// as soon as the connection closes.
 fn spawn_on_keeper(cmd: Command) -> std::io::Result<Child> {
     static KEEPER: std::sync::OnceLock<std::sync::Mutex<mpsc::Sender<SpawnJob>>> = std::sync::OnceLock::new();
     let tx = KEEPER.get_or_init(|| {
@@ -60,16 +60,18 @@ impl EmulatorProcess {
             .output()
             .map_err(|e| format!("aws-emulator を起動できない({}): {e}。--emulator で場所を指定する", self.binary))?;
         self.version = String::from_utf8_lossy(&v.stdout).lines().next().unwrap_or("").to_string();
-        // -a off: 記録した署名は再起動後の資格情報では通らないので、検証を外す(proxy.rs の冒頭を参照)
+        // -a off: recorded signatures do not pass with the credentials after a restart, so verification is turned
+        // off (see the top of proxy.rs)
         let mut cmd = Command::new(&self.binary);
         cmd.args(["-b", "127.0.0.1", "-p", "0", "-a", "off"]).args(&self.extra_args);
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
-            // 親(このプロキシ)がどう終わっても(abort や SIGKILL で Drop が走らなくても)、子に SIGTERM が届くようにする。
-            // PDEATHSIG は親の「プロセス」ではなく fork した「スレッド」が終わると発火するので、起動は spawn_on_keeper
-            // (プロセスと同じだけ生きるスレッド)で行う。macOS には同じ仕組みがないので、シグナルで止めたときにだけ片付く
-            // SAFETY: fork と exec のあいだで呼ぶのは、async-signal-safe な prctl だけ
+            // Makes sure the child gets SIGTERM however the parent (this proxy) ends, even when Drop does not run
+            // because of abort or SIGKILL. PDEATHSIG fires when the forking *thread* ends, not the parent *process*,
+            // so spawning happens in spawn_on_keeper (a thread that lives as long as the process). macOS has no
+            // equivalent, so there the child is cleaned up only when the proxy is stopped by a signal
+            // SAFETY: the only call between fork and exec is prctl, which is async-signal-safe
             unsafe {
                 cmd.pre_exec(|| {
                     if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
@@ -122,8 +124,8 @@ impl EmulatorProcess {
 
     pub fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
-            // std の Child::kill は SIGKILL。エミュレータが自分の一時ファイルを片付けられるよう SIGTERM を送る
-            // SAFETY: 自分が起動して、まだ回収していない子プロセスの pid に送るだけ
+            // std's Child::kill sends SIGKILL. Send SIGTERM so the emulator can clean up its own temporary files
+            // SAFETY: only sends to the pid of a child this process started and has not reaped yet
             unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) };
             let deadline = Instant::now() + Duration::from_secs(10);
             while Instant::now() < deadline {

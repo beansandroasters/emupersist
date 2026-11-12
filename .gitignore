@@ -1,16 +1,17 @@
-# ビルド成果物
+# Build output
 /target/
 
-# ジャーナル(記録した要求の本文がそのまま入る: シークレットの値、アクセスキー ID など)。
-# 既定の置き場所と、利用者が手元に作りがちな保存先。誤ってコミットしないよう広めに外す
+# Journals (they contain recorded request bodies verbatim: secret values, access key IDs, and so on).
+# The default location and places where users tend to save them locally. Excluded broadly so they are not committed
+# by mistake.
 .emupersist/
 *.jsonl
 *.db
 *.db-wal
 *.db-shm
 
-# 秘密を入れがちなファイル。エミュレータの CA(ca.pem)やクレデンシャル(emulator_credentials)を
-# 手元に写したときも、誤ってコミットしないように外す
+# Files that tend to hold secrets. Also excluded so that a local copy of the emulator CA (ca.pem) or
+# credentials (emulator_credentials) is not committed by mistake.
 .env
 .env.*
 *.pem
@@ -19,15 +20,15 @@
 emulator_credentials
 credentials
 
-# 手元に置いた aws-emulator 本体(別ライセンスの配布物)
+# A local copy of aws-emulator itself (distributed under a separate license)
 /aws-emulator
 
-# エディタ・OS
+# Editors and OS
 .DS_Store
 .idea/
 .vscode/
 *.swp
 *~
 
-# 互換テストの見本ジャーナル(テスト用の値だけが入っている)
+# Sample journals for the compatibility tests (they contain only test values)
 !/tests/fixtures/*.jsonl

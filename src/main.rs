@@ -1,4 +1,4 @@
-//! emupersist のコマンドライン。
+//! The emupersist command line.
 
 use std::collections::HashSet;
 use std::net::TcpListener;
@@ -14,7 +14,7 @@ use emupersist::proxy::{replay, BrowserGuard, Journal, Proxy, ResetFn, STOP};
 use emupersist::stores::open_store;
 
 const DEFAULT_STORE: &str = "file:.emupersist/journal.jsonl";
-/// 受け付ける要求本文の既定の上限。要求はメモリに丸ごと載せるので、上限なしにはしない
+/// The default limit on accepted request bodies. Requests are held entirely in memory, so there is always a limit
 const DEFAULT_MAX_BODY: usize = 512 * 1024 * 1024;
 
 const USAGE: &str = "\
@@ -203,8 +203,8 @@ fn run(a: Args) -> Result<i32, String> {
         _ => {}
     }
 
-    // エミュレータを起動する前に入れる。リプレイ中に SIGTERM を受けても、子を片付けてから終われるように
-    // SAFETY: シグナルハンドラはアトミック変数に書くだけ(async-signal-safe)
+    // Install before starting the emulator, so that even a SIGTERM during replay exits after cleaning up the child
+    // SAFETY: the signal handler only writes an atomic variable (async-signal-safe)
     unsafe {
         libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
@@ -255,7 +255,7 @@ fn run(a: Args) -> Result<i32, String> {
             return Err(e);
         }
     };
-    drop(loaded); // 本文はもう要らない
+    drop(loaded); // The bodies are no longer needed
     if failed > 0 && a.strict {
         stop_emulator();
         return Ok(1);

@@ -1,7 +1,7 @@
-# gitleaks の誤検出を、検出ごとの指紋で除外する(ルールごと切ると、本物まで見逃すため)。
+# Excludes gitleaks false positives by per-finding fingerprint (disabling a whole rule would also miss real secrets).
 #
-# tests/fixtures/journal-v1.jsonl は、ローカルの aws-emulator で記録したテスト用のジャーナル。
-# 指摘された値は KMS CreateKey のレスポンスにある CurrentKeyMaterialId で、エミュレータが
-# 架空のアカウント 000000000000 のために振った鍵素材の識別子。鍵そのものではなく、AWS のどの鍵とも関係がない。
+# tests/fixtures/journal-v1.jsonl is a test journal recorded against a local aws-emulator.
+# The flagged value is CurrentKeyMaterialId in a KMS CreateKey response: an identifier for key material that the
+# emulator assigned for the fictitious account 000000000000. It is not a key itself and is unrelated to any AWS key.
 28280ae53c7c2714c7b05993b5e89498af2e413d:tests/fixtures/journal-v1.jsonl:generic-api-key:3
 tests/fixtures/journal-v1.jsonl:generic-api-key:3
