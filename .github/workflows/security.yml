@@ -1,0 +1,71 @@
+# 依存とコードのセキュリティ検査。GitHub Actions の中だけで完結し、外部の SaaS には送らない。
+#
+# この CI そのものが攻撃の入口にならないよう、次を守っている(変えるときは理由を残す)。
+# - アクションは GitHub 公式のもの(actions/*, github/*)だけを使い、タグではなくコミット SHA で固定する。
+#   タグは後から付け替えられる(2025 年の tj-actions/changed-files の侵害では、既存のタグが
+#   悪意あるコミットに向け直された)。更新は Dependabot の PR で、SHA の差分として見る
+# - GITHUB_TOKEN の権限は既定ですべて外し、ジョブごとに必要な分だけ足す
+# - pull_request_target は使わない(フォークからの PR に、書き込み権限と秘密情報を渡さないため)
+# - checkout は認証情報を作業ツリーに残さない(persist-credentials: false)
+# - キャッシュは使わない(別のジョブが汚したキャッシュを読み込まないため。実行時間と引き換え)
+# - ツールはバージョンを固定し、依存も --locked で固定して入れる
+
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # 依存に変更がなくても、新しく公開されたアドバイザリを拾うため毎週回す(月曜 03:17 UTC)
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-deny:
+    name: cargo-deny (advisories, licenses, sources, bans)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install cargo-deny
+        # crates.io から、cargo-deny 自身の Cargo.lock どおりの依存でビルドする
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: cargo deny check
+        # 設定は deny.toml。Cargo.lock と食い違うときは落とす(--locked)
+        run: cargo deny --locked check
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write # 結果を Code scanning に上げる
+    strategy:
+      fail-fast: false
+      matrix:
+        # rust: このクレートのコード / actions: このディレクトリのワークフロー自体(式の注入、権限の広げすぎなど)
+        language: [rust, actions]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          category: /language:${{ matrix.language }}

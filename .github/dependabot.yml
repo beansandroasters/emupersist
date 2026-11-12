@@ -1,0 +1,22 @@
+# 依存とアクションの更新を PR で提案させる。
+# 公開から 7 日待ってから提案する(cooldown)。公開直後の版は、侵害された版が届くときの典型的な形なので。
+# セキュリティ更新(既知の脆弱性の修正)にはこの待ちは掛からない(Dependabot の仕様)。
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

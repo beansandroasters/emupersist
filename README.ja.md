@@ -170,6 +170,8 @@ S3 のオブジェクトのボディには、content type が JSON でも手を�
   - DNS rebinding: `Host` がループバックの名前(127.0.0.1、localhost、::1)でも待ち受けアドレスでもないリクエストは断ります。0.0.0.0 のような特定しないアドレスで待ち受けるときは、この確認をしません。
 - 壊れた入力は信用せずに断ります。大きすぎるボディ(413)、大きすぎるヘッダ(431)、途中で切れた chunked のボディ、`Transfer-Encoding` と `Content-Length` を両方持つリクエストが対象です。同時に受け付ける接続は 512 までで、何も送ってこない接続は 300 秒で閉じます。
 - 記録では Authorization の署名と署名付き URL の署名を伏せ、`X-Amz-Security-Token` を捨てています。
+- CI(`.github/workflows/security.yml`)では、push と pull request のたびと毎週 1 回、`cargo deny check` と CodeQL を回します。`cargo deny check` は RustSec のアドバイザリ、取り下げられた版、ライセンス、crates.io 以外からの依存を検査します(設定は `deny.toml`)。CodeQL は Rust のコードとワークフロー自体を検査します。アクションはコミット SHA で固定し、Dependabot は公開から 7 日経った版だけを提案します。
+- 脆弱性の報告の方法は [SECURITY.md](SECURITY.md) にあります。
 - **ジャーナルにはリクエストボディがそのまま入ります**(シークレットの値、アクセスキー ID など)。テスト用の値だけを入れてください。
   `.gitignore` は既定の置き場所 `.emupersist/` と `*.jsonl`、`*.db` を除外しています。
 

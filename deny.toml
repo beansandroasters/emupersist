@@ -1,0 +1,39 @@
+# cargo-deny の設定。CI(.github/workflows/security.yml)と手元の `cargo deny check` の両方が読む。
+# 依存を増やすときにここで止まったら、理由を確かめてから許可を足す。黙って緩めない。
+
+[graph]
+# feature "sqlite" を外したビルドも出すので、どちらの依存も検査する
+all-features = true
+
+[advisories]
+# RustSec のアドバイザリデータベースと照合する。脆弱性・取り下げ(yanked)・保守終了は既定で落ちる。
+# 例外を足すときは、理由と見直す期日をコメントに書く
+ignore = []
+
+[licenses]
+# 実際の依存が使っているものだけを許す(2026-11-12 時点)。新しいライセンスの依存が入ったら、
+# ここで落ちるので、配布の条件と両立するかを確かめてから足す
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "ISC",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-roots が同梱するルート証明書のデータ(Mozilla の CA 一覧を由来とする)
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+# バージョンを "*" で指定した依存は、何が入るか決まらないので禁止する
+wildcards = "deny"
+
+[sources]
+# crates.io 以外(ほかのレジストリ、git リポジトリ)からの依存を禁止する。
+# 取得元を差し替える型のサプライチェーン攻撃を、依存を足す段階で止めるため
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

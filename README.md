@@ -170,6 +170,8 @@ So the following are never learned:
   - **DNS rebinding**: requests whose `Host` is not a loopback name (127.0.0.1, localhost, ::1) or the bind address are rejected. This check is skipped when binding to an unspecified address such as 0.0.0.0.
 - Malformed input is rejected rather than trusted: oversized bodies (413), oversized headers (431), truncated chunked bodies, and requests carrying both `Transfer-Encoding` and `Content-Length`. Up to 512 connections are served at once, and idle connections are closed after 300 seconds.
 - Records have the signature in Authorization and in presigned URLs redacted, and `X-Amz-Security-Token` dropped.
+- CI (`.github/workflows/security.yml`) runs `cargo deny check` (RustSec advisories, yanked crates, licenses, and a crates.io-only source policy, configured in `deny.toml`) and CodeQL for both the Rust code and the workflows themselves, on every push, pull request, and weekly. Actions are pinned to commit SHAs, and Dependabot proposes updates only after a 7-day cooldown.
+- To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - **The journal contains request bodies verbatim** (secret values, access key IDs, and so on). Put only test values in it.
   `.gitignore` excludes the default location `.emupersist/` as well as `*.jsonl` and `*.db`.
 
