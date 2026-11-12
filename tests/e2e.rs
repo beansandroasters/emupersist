@@ -1,5 +1,6 @@
-//! 本物の aws-emulator を相手にした往復テスト。EMUPERSIST_TEST_EMULATOR に実行ファイルの場所を入れたときだけ動く。
-//! クライアントはこのクレートの SigV4 署名器と HTTP クライアントで組む(aws CLI や SDK に依存しない)。
+//! Round-trip tests against a real aws-emulator. They run only when EMUPERSIST_TEST_EMULATOR is set to the path of
+//! the executable.
+//! The client is built from this crate's SigV4 signer and HTTP client (no dependency on the aws CLI or an SDK).
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -19,7 +20,7 @@ fn emulator() -> Option<String> {
     e
 }
 
-/// 起動した emupersist。落ちたテストでもプロセスを残さないよう、Drop で止める。
+/// A running emupersist. Stopped in Drop so that a failed test does not leave the process behind.
 struct Running {
     child: Option<Child>,
     client: Client,
@@ -37,7 +38,7 @@ impl Running {
             .stderr(Stdio::piped())
             .spawn()
             .expect("起動できない");
-        // 標準エラーは別スレッドで吸い出す。読まずにいるとパイプが埋まり、emupersist の書き込みが詰まる
+        // Drain stderr on a separate thread. Left unread, the pipe fills up and emupersist's writes block
         let log = Arc::new(Mutex::new(String::new()));
         let (sink, mut stderr) = (log.clone(), child.stderr.take().unwrap());
         std::thread::spawn(move || {
@@ -61,7 +62,7 @@ impl Running {
 
     fn call(&self, method: &str, path: &str, service: &str, headers: &[(&str, &str)], body: &[u8]) -> Response {
         let h: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        // 署名検証を外したエミュレータ(-a off)に送るためのダミーで、どこでも有効な資格情報ではない
+        // A dummy for sending to an emulator with signature verification off (-a off). Not valid credentials anywhere
         let creds = Creds { akid: "AKIATESTCLIENT".into(), secret: "secret".into(), token: None }; // pragma: allowlist secret
         let path_only = path.split('?').next().unwrap();
         let signed: Headers = sign(method, &self.host, path_only, &[], &h, body, "us-east-1", service, &creds);
@@ -83,13 +84,13 @@ impl Running {
         self.child.as_ref().unwrap().id()
     }
 
-    /// SIGTERM で止めて、標準エラー(ログ)を返す。
+    /// Stops with SIGTERM and returns stderr (the log).
     fn stop(mut self) -> String {
         let mut child = self.child.take().unwrap();
-        // SAFETY: 自分が起動して、まだ回収していない子プロセスに SIGTERM を送るだけ
+        // SAFETY: only sends SIGTERM to a child this process started and has not reaped yet
         unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
         child.wait().unwrap();
-        std::thread::sleep(Duration::from_millis(100)); // 吸い出しスレッドが最後まで読むのを待つ
+        std::thread::sleep(Duration::from_millis(100)); // Wait for the drain thread to read to the end
         let log = self.log.lock().unwrap().clone();
         log
     }
@@ -124,7 +125,7 @@ fn wait_active(e: &Running, table: &str) {
 }
 
 fn blob() -> Vec<u8> {
-    // 本文に ID らしい文字列が混ざっても書き換えないことも見る(擬似乱数で十分)
+    // Also checks that ID-like strings in the body are not rewritten (pseudo-random data is enough)
     let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
     (0..50_000)
         .map(|_| {
@@ -136,7 +137,7 @@ fn blob() -> Vec<u8> {
         .collect()
 }
 
-/// 1回目: テーブル・KMS キー・S3 オブジェクトを作る。乱数で振られるキー ID を返す。
+/// First run: creates a table, a KMS key, and an S3 object. Returns the randomly assigned key ID.
 fn write_phase(e: &Running, blob: &[u8]) -> String {
     let (st, out) = e.json(
         "dynamodb",
@@ -169,7 +170,7 @@ fn write_phase(e: &Running, blob: &[u8]) -> String {
     key_id
 }
 
-/// 2回目: 再起動後に、状態と ID が戻っているか。
+/// Second run: checks that state and IDs are restored after the restart.
 fn read_phase(e: &Running, key_id: &str, blob: &[u8]) {
     let (_, out) =
         e.json("dynamodb", "DynamoDB_20120810.GetItem", json!({"TableName": "users", "Key": {"id": {"S": "u1"}}}));
@@ -199,7 +200,7 @@ fn state_survives_restart() {
     assert!(!ops.contains(&"ReceiveMessage"), "空振りの受信は記録しない: {ops:?}");
     assert!(!ops.contains(&"DescribeTable"));
 
-    // ID の対応表が効いている状態で、S3 に置いた JSON の中身は書き換えない(利用者のデータなので)
+    // With the ID mapping table active, JSON content stored in S3 is not rewritten (it is the user's data)
     let doc = format!(r#"{{"kms_key":"{key_id}"}}"#);
     let put = e.call("PUT", "/bkt/config.json", "s3", &[("content-type", "application/json")], doc.as_bytes());
     assert_eq!(put.status, 200);
@@ -210,15 +211,16 @@ fn state_survives_restart() {
     let (st, _) =
         e.json("dynamodb", "DynamoDB_20120810.GetItem", json!({"TableName": "users", "Key": {"id": {"S": "u1"}}}));
     assert_eq!(st, 400, "作り直したエミュレータにはテーブルがない");
-    // reset の後も、接続を閉じたあとでもエミュレータが生きている(PDEATHSIG を接続スレッドで仕掛けていない)
+    // After reset, and even after the connection closes, the emulator is still alive (PDEATHSIG is not set up on a
+    // connection thread)
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(e.json("sqs", "AmazonSQS.ListQueues", json!({})).0, 200);
     let log = e.stop();
     assert!(log.contains("食い違い 0 件"), "{log}");
 }
 
-/// 複数のクライアントが同じ項目を同時に書き換えても、再起動の後に最後の値が入れ替わらない。
-/// 書き込みを並行に通していた版では、8 クライアントで 20 回中 14 回入れ替わった。
+/// Even when several clients update the same item concurrently, the last value is not swapped after a restart.
+/// In the version that let writes through concurrently, it was swapped in 14 of 20 trials with 8 clients.
 #[test]
 fn concurrent_writes_to_one_item_survive_restart_in_order() {
     let Some(emu) = emulator() else { return };
@@ -258,7 +260,8 @@ fn concurrent_writes_to_one_item_survive_restart_in_order() {
     }
 }
 
-/// 形式 v1 のジャーナル(別の実装で記録した見本)を、そのまま読んで状態を戻せる。保存形式を変えていないことの確認。
+/// A format v1 journal (a sample recorded by the other implementation) can be read as is to restore state. Confirms
+/// that the storage format has not changed.
 #[test]
 fn replays_v1_journal_fixture() {
     let Some(emu) = emulator() else { return };
@@ -283,7 +286,7 @@ fn replays_v1_journal_fixture() {
     assert!(log.contains("食い違い 0 件"), "{log}");
 }
 
-/// レビューで見つかった攻撃と壊れた入力に対する振る舞い。
+/// Behavior against the attacks and malformed inputs found in review.
 #[test]
 fn rejects_hostile_requests_and_survives() {
     let Some(emu) = emulator() else { return };
@@ -297,25 +300,25 @@ fn rejects_hostile_requests_and_survives() {
         String::from_utf8_lossy(&out).into_owned()
     };
     let host = e.host.clone();
-    // 巨大な Content-Length でもプロセスは落ちず、413 を返す
+    // A huge Content-Length does not crash the process; it returns 413
     let r = raw(format!("POST / HTTP/1.1\r\nHost: {host}\r\nContent-Length: 999999999999999\r\n\r\n").as_bytes());
     assert!(r.starts_with("HTTP/1.1 413"), "{r}");
-    // ブラウザの別オリジンからの reset(CSRF)と、DNS rebinding の Host は断る
+    // A reset from a cross-origin browser page (CSRF) and a DNS rebinding Host are rejected
     let r = raw(format!("POST /__persist/reset HTTP/1.1\r\nHost: {host}\r\nOrigin: https://evil.example\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes());
     assert!(r.starts_with("HTTP/1.1 403"), "{r}");
     let r = raw(b"GET /__persist/status HTTP/1.1\r\nHost: evil.example:4566\r\nConnection: close\r\n\r\n");
     assert!(r.starts_with("HTTP/1.1 403"), "{r}");
-    // 途中で切れた chunked 本文は、エミュレータに届けず記録もしない
+    // A truncated chunked body is neither forwarded to the emulator nor recorded
     let r =
         raw(format!("PUT /bkt HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n").as_bytes());
     assert!(r.is_empty() || !r.starts_with("HTTP/1.1 200"), "{r}");
-    // ここまで来ても生きていて、何も記録していない
+    // After all this it is still alive and has recorded nothing
     let status: Value = serde_json::from_slice(&e.admin("GET", "status").body).unwrap();
     assert_eq!(status["records"], 0, "{status}");
     e.stop();
 }
 
-/// emupersist が SIGKILL で死んでも、子のエミュレータが孤児として残らない(Linux の PDEATHSIG)。
+/// Even if emupersist dies from SIGKILL, the child emulator is not left behind as an orphan (Linux PDEATHSIG).
 #[cfg(target_os = "linux")]
 #[test]
 fn emulator_does_not_outlive_a_killed_proxy() {

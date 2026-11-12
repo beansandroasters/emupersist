@@ -1,11 +1,11 @@
-//! ジャーナルの保存先。どの実装も「末尾に追記する」「先頭から順に読む」「全部消す」の3操作だけを持つ。
-//! 保存先は URL の形で選ぶ。
+//! Journal stores. Every implementation has only three operations: append to the end, read in order from the
+//! start, and delete everything. The store is chosen by a URL.
 //!
 //! ```text
-//! file:./state.jsonl            1行1レコードの JSON Lines(既定)
-//! sqlite:./state.db             feature "sqlite"(既定で有効)。1ファイルに複数の名前空間
-//! dynamodb://TABLE?region=..    共有・条件付き書き込み(aws.rs)
-//! s3://BUCKET/PREFIX?region=..  1レコード1オブジェクト(aws.rs)
+//! file:./state.jsonl            JSON Lines, one record per line (default)
+//! sqlite:./state.db             feature "sqlite" (enabled by default). Multiple namespaces in one file
+//! dynamodb://TABLE?region=..    Shared, conditional writes (aws.rs)
+//! s3://BUCKET/PREFIX?region=..  One object per record (aws.rs)
 //! ```
 
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use serde_json::Value;
 
 #[derive(Debug)]
 pub enum StoreError {
-    /// 同じ名前空間に別の書き手がいて、連番がぶつかった。
+    /// Another writer is using the same namespace and the sequence numbers collided.
     Conflict(String),
     Other(String),
 }
@@ -45,7 +45,7 @@ pub trait Store: Send + Sync {
     fn read_all(&self) -> StoreResult<Vec<Value>>;
     fn clear(&self) -> StoreResult<()>;
     fn describe(&self) -> String;
-    /// 保存先を用意する(DynamoDB のテーブル作成)。作ったら true。
+    /// Prepares the store (creates the DynamoDB table). Returns true if it created something.
     fn ensure(&self) -> StoreResult<Option<bool>> {
         Ok(None)
     }
@@ -55,12 +55,13 @@ pub fn seq_of(record: &Value) -> u64 {
     record.get("seq").and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// JSON Lines。ファイルそのものが1つの名前空間になる。
+/// JSON Lines. The file itself is one namespace.
 ///
-/// 1件ごとに fsync する。プロセスが落ちても、書き終えたレコードは残る。
-/// 書きかけの最終行は、読み込み時にファイルから切り詰める。失われるのはその1件だけで、後の追記は壊れない
-/// (切り詰めずに残すと、次の追記がその後ろに連結され、壊れた行が途中に挟まって読めなくなる)。
-/// ファイルは 0600 で作る(要求の本文がそのまま入るため)。
+/// Calls fsync after every record. Records that were fully written survive a process crash.
+/// A partially written last line is truncated from the file when reading. Only that one record is lost, and later
+/// appends are not corrupted (if it were kept, the next append would be joined onto it, leaving a broken line in the
+/// middle that makes the file unreadable).
+/// The file is created with mode 0600 (because it contains request bodies verbatim).
 pub struct FileStore {
     path: PathBuf,
     lock: Mutex<()>,
@@ -76,14 +77,15 @@ impl FileStore {
     }
 }
 
-/// 0600 で開く(なければ作る)。`append` が false なら作るだけで、中身には触らない。
+/// Opens with mode 0600 (creating the file if missing). If `append` is false, it only creates the file and does not
+/// touch the contents.
 fn private_file(path: &std::path::Path, append: bool) -> std::io::Result<fs::File> {
     let mut o = OpenOptions::new();
     o.create(true).read(true);
     if append {
         o.append(true);
     } else {
-        o.write(true); // 作るだけ(中身は消さない)
+        o.write(true); // Create only (do not erase the contents)
     }
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
@@ -99,7 +101,8 @@ impl Store for FileStore {
         let mut f = private_file(&self.path, true).map_err(err)?;
         let before = f.metadata().map_err(err)?.len();
         if let Err(e) = f.write_all(line.as_bytes()).and_then(|_| f.sync_all()) {
-            // 書きかけの行を残すと、次の追記が連結されて壊れる。書く前の長さに戻す
+            // A partial line left behind would be joined with the next append and corrupt it. Restore the length
+            // from before the write
             let _ = f.set_len(before);
             return Err(err(e).into());
         }
@@ -134,7 +137,8 @@ impl Store for FileStore {
                 }
             }
             if last && !terminated && !text.is_empty() {
-                // 改行だけ書けずに落ちた行。読めたので残し、次の追記と連結しないよう改行を足す
+                // A line whose newline was not written before a crash. It parsed, so keep it and add the newline
+                // so the next append is not joined onto it
                 let mut f = private_file(&self.path, true).map_err(err)?;
                 f.write_all(b"\n").and_then(|_| f.sync_all()).map_err(err)?;
             }
@@ -167,10 +171,10 @@ pub struct SqliteStore {
 impl SqliteStore {
     pub fn new(path: &str, ns: &str) -> StoreResult<Self> {
         let path = std::path::absolute(path).map_err(|e| format!("パスを解決できない {path}: {e}"))?;
-        // 要求の本文がそのまま入るので、ほかの利用者から読めないよう先に 0600 で作っておく
+        // The file contains request bodies verbatim, so create it with mode 0600 first so other users cannot read it
         private_file(&path, false).map_err(|e| format!("{}: {e}", path.display()))?;
         let db = rusqlite::Connection::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        // journal_mode は結果の行を返すので execute ではなく query で流す
+        // journal_mode returns a result row, so run it with a query instead of execute
         db.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())).map_err(|e| e.to_string())?;
         db.execute(
             "CREATE TABLE IF NOT EXISTS journal (ns TEXT NOT NULL, seq INTEGER NOT NULL, rec TEXT NOT NULL, PRIMARY KEY (ns, seq))",
@@ -243,7 +247,7 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `scheme://netloc/path?k=v&...` を分ける。
+/// Splits `scheme://netloc/path?k=v&...` into its parts.
 pub fn split_url(url: &str) -> (String, String, HashMap<String, String>) {
     let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
     let (main, query) = rest.split_once('?').unwrap_or((rest, ""));
@@ -259,7 +263,8 @@ pub fn split_url(url: &str) -> (String, String, HashMap<String, String>) {
     (netloc.to_string(), path.trim_matches('/').to_string(), opts)
 }
 
-/// 名前空間に使える文字。S3 ではキーの接頭辞になるので、`/` を許すと `a` の一覧に `a/b` が混ざる。
+/// Characters allowed in a namespace. In S3 the namespace becomes a key prefix, so allowing `/` would mix `a/b` into
+/// the listing of `a`.
 pub fn validate_namespace(ns: &str) -> StoreResult<()> {
     let ok = !ns.is_empty() && ns.len() <= 128 && ns.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b));
     if ok {
@@ -310,11 +315,12 @@ mod tests {
         let all = s.read_all().unwrap();
         assert_eq!(all.iter().map(seq_of).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(all[0]["body"], "フリーレン");
-        // 書きかけを切り詰めたので、その後の追記が壊れない(レビューで再現した不具合の回帰テスト)
+        // The partial line was truncated, so later appends are not corrupted (regression test for a bug reproduced in
+        // review)
         s.append(&json!({"seq": 3})).unwrap();
         s.append(&json!({"seq": 4})).unwrap();
         assert_eq!(s.read_all().unwrap().iter().map(seq_of).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
-        // 改行だけ欠けた最終行は残し、改行を足す
+        // A last line missing only its newline is kept, and the newline is added
         OpenOptions::new().append(true).open(&s.path).unwrap().write_all(b"{\"seq\": 5}").unwrap();
         assert_eq!(s.read_all().unwrap().len(), 5);
         s.append(&json!({"seq": 6})).unwrap();

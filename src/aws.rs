@@ -1,11 +1,11 @@
-//! AWS 上の保存先(DynamoDB / S3)。AWS SDK を使わず、SigV4 を自前で署名する(HMAC-SHA256 は ring)。
+//! Stores on AWS (DynamoDB / S3). Signs SigV4 itself without the AWS SDK (HMAC-SHA256 comes from ring).
 //!
-//! aws-sdk-dynamodb と aws-sdk-s3 を入れると、tokio・hyper・aws-smithy-* で依存が百を超える。
-//! このツールが AWS に投げるのは PutItem / DeleteItem / Query / BatchWriteItem / CreateTable /
-//! DescribeTable と S3 の Put / Get / List / Delete だけなので、署名は自前で持つ。
+//! Adding aws-sdk-dynamodb and aws-sdk-s3 would bring over a hundred dependencies through tokio, hyper, and
+//! aws-smithy-*. This tool only sends PutItem / DeleteItem / Query / BatchWriteItem / CreateTable /
+//! DescribeTable and S3 Put / Get / List / Delete to AWS, so it does its own signing.
 //!
-//! 資格情報の探し方: 環境変数 → 共有設定ファイルの静的キー → credential_process。
-//! SSO や AssumeRole(role_arn)の連鎖は扱わない。
+//! Credential lookup order: environment variables -> static keys in the shared config files -> credential_process.
+//! SSO and AssumeRole (role_arn) chains are not supported.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -18,10 +18,11 @@ use crate::http::{Client, Headers};
 use crate::stores::{seq_of, Store, StoreError, StoreResult};
 use crate::util::{b64decode, b64encode, civil, hex, quote, zlib_compress, zlib_decompress};
 
-/// DynamoDB の項目上限は 400KB。名前やキーの分を引いて、レコード本体はこの大きさで分割する。
+/// The DynamoDB item limit is 400KB. Leaving room for attribute names and keys, record bodies are split into chunks
+/// of this size.
 const DDB_CHUNK: usize = 350_000;
 
-// --- 資格情報 -------------------------------------------------------------
+// --- Credentials ----------------------------------------------------------
 
 #[derive(Clone)]
 pub struct Creds {
@@ -43,7 +44,7 @@ fn expand(path: &str) -> String {
     path.strip_prefix("~/").map(|p| format!("{}/{p}", home())).unwrap_or_else(|| path.to_string())
 }
 
-/// 共有設定ファイルの INI。字下げされた継続行(`s3 =` の下など)は読み飛ばす。
+/// Reads the INI of a shared config file. Indented continuation lines (such as those under `s3 =`) are skipped.
 fn read_ini(path: &str) -> HashMap<String, HashMap<String, String>> {
     let mut out: HashMap<String, HashMap<String, String>> = HashMap::new();
     let Ok(text) = std::fs::read_to_string(expand(path)) else { return out };
@@ -144,8 +145,9 @@ impl Credentials {
             let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
             let exp = s("Expiration").map(|e| {
                 crate::util::parse_iso8601(&e).unwrap_or_else(|| {
-                    // 読めない期限を「期限なし」として抱え続けると、切れたあとも使い続けてしまう。
-                    // 15 分後に切れるものとして扱い、10 分後(期限の 5 分前)に取り直す
+                    // Keeping an unreadable expiration as "never expires" would keep using the credentials after
+                    // they expire. Treat them as expiring in 15 minutes, so they are refetched after 10 minutes
+                    // (5 minutes before that expiration)
                     crate::log!("credential_process の Expiration {e:?} を読めない。10 分ごとに取り直す");
                     now_secs() + 900
                 })
@@ -176,7 +178,7 @@ fn hmac_sha256(key: &[u8], msg: &str) -> Vec<u8> {
     hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), msg.as_bytes()).as_ref().to_vec()
 }
 
-/// 署名ヘッダを足したヘッダ一覧を返す。path は URI エンコード済みのものを渡す。
+/// Returns the header list with the signing headers added. `path` must already be URI-encoded.
 #[allow(clippy::too_many_arguments)]
 pub fn sign(
     method: &str,
@@ -232,7 +234,7 @@ pub fn sign(
     hs
 }
 
-/// 署名つき HTTPS クライアント。
+/// An HTTPS client that signs its requests.
 pub struct AwsHttp {
     client: Client,
     region: String,
@@ -268,8 +270,8 @@ impl AwsHttp {
         let qs =
             query.iter().map(|(k, v)| format!("{}={}", quote(k, "~"), quote(v, "~"))).collect::<Vec<_>>().join("&");
         let target = if qs.is_empty() { path.to_string() } else { format!("{path}?{qs}") };
-        // 届かなかったとき・5xx・スロットリングは、間隔を伸ばしながら最大 RETRIES 回やり直す。
-        // やり直した書き込みが実は届いていた場合の扱いは、呼び出し側(条件付き書き込みの照合)が持つ
+        // On connection failures, 5xx, and throttling, retry up to RETRIES times with growing intervals.
+        // The caller (by checking conditional writes) handles the case where a retried write had actually arrived
         let mut wait = Duration::from_millis(100);
         for attempt in 0..=RETRIES {
             let creds = self.creds.get()?;
@@ -291,7 +293,8 @@ impl AwsHttp {
     }
 }
 
-/// AWS へのやり直しの回数(初回を除く)。間隔は 100ms から倍々で、最後は 1.6 秒前後。
+/// The number of retries to AWS (not counting the first attempt). The interval starts at 100ms and doubles, ending
+/// at around 1.6 seconds.
 const RETRIES: u32 = 4;
 
 fn is_throttle(body: &[u8]) -> bool {
@@ -301,7 +304,7 @@ fn is_throttle(body: &[u8]) -> bool {
         .any(|c| text.contains(c))
 }
 
-/// 0〜wait/2 のゆらぎ。複数のプロセスが同じ間隔でやり直して、また同時にぶつかるのを避ける。
+/// Jitter between 0 and wait/2. Keeps multiple processes from retrying at the same interval and colliding again.
 fn jitter(wait: Duration) -> Duration {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0) as u64;
     Duration::from_nanos(nanos % (wait.as_nanos() as u64 / 2 + 1))
@@ -329,12 +332,12 @@ fn region_of(opts: &HashMap<String, String>, scheme: &str) -> Result<String, Str
 
 // --- DynamoDB ------------------------------------------------------------
 
-/// パーティションキー ns(S)、ソートキー sk(S) のテーブルに、1レコードを1〜n項目で書く。
+/// Writes each record as 1 to n items in a table with partition key ns (S) and sort key sk (S).
 ///
-/// sk は "<seq 12桁>.<part 4桁>"。400KB を超えるレコードは分割する。各項目は attribute_not_exists
-/// 条件つきで書くので、同じ名前空間に2つのプロキシが書き込むと、後から来た方が Conflict で止まる。
-/// ただし条件に当たった項目が自分の書こうとした内容と同じなら、それは自分の前回の試み(応答だけ
-/// 失われてやり直したもの)なので、成功として扱う。
+/// sk is "<seq, 12 digits>.<part, 4 digits>". Records over 400KB are split. Each item is written with an
+/// attribute_not_exists condition, so when two proxies write to the same namespace, the later one stops with
+/// Conflict. However, if the item that failed the condition has the same content this writer was about to write, it
+/// is this writer's own previous attempt (retried because only the response was lost), so it is treated as success.
 pub struct DynamoDbStore {
     table: String,
     ns: String,
@@ -400,7 +403,8 @@ impl Store for DynamoDbStore {
     fn append(&self, record: &Value) -> StoreResult<()> {
         let blob = pack(record);
         let chunks: Vec<&[u8]> = if blob.is_empty() { vec![&[][..]] } else { blob.chunks(DDB_CHUNK).collect() };
-        // 後ろの断片から書き、最後に part 0 を書く。読む側は全断片が揃ったレコードだけを使う。
+        // Write the chunks from the last one and write part 0 last. Readers use only records with every chunk
+        // present.
         for part in (0..chunks.len()).rev() {
             let sk = format!("{:012}.{:04}", seq_of(record), part);
             let rec = b64encode(chunks[part]);
@@ -426,15 +430,16 @@ impl Store for DynamoDbStore {
         Ok(())
     }
 
-    /// 全断片が揃ったレコードだけを返す。揃っていない断片は分割レコードを書いている途中で落ちた跡なので消す
-    /// (残すと、次の書き込みが同じ sk にぶつかって Conflict が出続ける)。
+    /// Returns only records with every chunk present. Incomplete chunks are left over from a crash while writing a
+    /// split record, so they are deleted (if kept, the next write would hit the same sk and keep failing with
+    /// Conflict).
     fn read_all(&self) -> StoreResult<Vec<Value>> {
         let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
         for item in self.items(None)? {
             let seq = s_attr(&item, "sk").split('.').next().unwrap_or("").to_string();
             match groups.last_mut() {
                 Some((s, v)) if *s == seq => v.push(item),
-                _ => groups.push((seq, vec![item])), // Query はソートキー順に返す
+                _ => groups.push((seq, vec![item])), // Query returns items in sort key order
             }
         }
         let mut out = Vec::new();
@@ -470,7 +475,7 @@ impl Store for DynamoDbStore {
             let mut wait = Duration::from_millis(50);
             while pending.as_object().is_some_and(|o| !o.is_empty()) {
                 if wait > Duration::from_millis(50) {
-                    std::thread::sleep(wait); // UnprocessedItems はスロットリングで返る。間を空けて送り直す
+                    std::thread::sleep(wait); // UnprocessedItems comes back on throttling. Wait, then resend
                 }
                 wait = (wait * 2).min(Duration::from_secs(2));
                 pending = self
@@ -509,19 +514,21 @@ impl Store for DynamoDbStore {
 
 // --- S3 ------------------------------------------------------------------
 
-/// `<prefix>/<ns>/<seq 12桁>.json.z` に、1レコードを1オブジェクトで書く。
+/// Writes each record as one object at `<prefix>/<ns>/<seq, 12 digits>.json.z`.
 ///
-/// PutObject に If-None-Match: * を付ける。同じ連番に2つ目の書き手が来ると 412 になり Conflict で止まる
-/// (既にあるオブジェクトが自分の書こうとした内容と同じなら、自分の前回の試みなので成功として扱う)。
-/// 接頭辞の下にあるジャーナル以外のオブジェクト(名前が `<12桁>.json.z` でないもの)は読み飛ばす。
-/// 起動時の読み込みはレコード数ぶん GET を投げるので、レコードが数千を超えると起動が遅くなる。
+/// PutObject is sent with If-None-Match: *. A second writer for the same sequence number gets 412 and stops with
+/// Conflict (if the existing object has the same content this writer was about to write, it is this writer's own
+/// previous attempt, so it is treated as success).
+/// Objects under the prefix that are not journal records (names not of the form `<12 digits>.json.z`) are skipped.
+/// Loading at startup sends one GET per record, so startup gets slow once there are more than a few thousand records.
 pub struct S3Store {
     bucket: String,
     prefix: String,
     http: AwsHttp,
 }
 
-/// `<tag>...</tag>` の中身を順に取り出す。ListObjectsV2 の応答を読むのに足りる分だけの XML 読み。
+/// Extracts the contents of each `<tag>...</tag>` in order. Just enough XML parsing to read ListObjectsV2
+/// responses.
 pub fn xml_texts(body: &str, tag: &str) -> Vec<String> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     let mut out = Vec::new();
@@ -544,7 +551,7 @@ impl S3Store {
         let region = region_of(opts, "s3")?;
         let creds = Credentials::new(opt(opts, "profile").map(str::to_string));
         let endpoint = match opt(opts, "endpoint") {
-            Some(e) => format!("{}/{bucket}", e.trim_end_matches('/')), // エミュレータなど: パス形式
+            Some(e) => format!("{}/{bucket}", e.trim_end_matches('/')), // Emulators and the like: path-style
             None => format!("https://{bucket}.s3.{region}.amazonaws.com"),
         };
         let prefix = [prefix, ns].iter().filter(|p| !p.is_empty()).cloned().collect::<Vec<_>>().join("/") + "/";
@@ -601,7 +608,7 @@ impl Store for S3Store {
             412 => {
                 let (st, _, existing) = self.http.request("GET", &Self::key_path(&key), &[], &[], b"")?;
                 if st == 200 && existing == blob {
-                    return Ok(()); // 応答だけ失われた自分の前回の試み
+                    return Ok(()); // Our own previous attempt whose response was lost
                 }
                 Err(StoreError::Conflict(format!("s3://{}/{key} は既にある(別の書き手がいる?)", self.bucket)))
             }
@@ -656,14 +663,15 @@ mod tests {
         assert_eq!(xml_texts(body, "NextContinuationToken"), vec!["tok"]);
     }
 
-    /// AWS の SigV4 テストスイート(get-vanilla)と同じ鍵導出・署名になることを、既知の値で確かめる。
+    /// Checks against known values that key derivation and signing match the AWS SigV4 test suite (get-vanilla).
     #[test]
     fn signing_key_derivation() {
         let mut key = hmac_sha256(b"AWS4wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "20150830");
         for part in ["us-east-1", "iam", "aws4_request"] {
             key = hmac_sha256(&key, part);
         }
-        // 期待値は、AWS のドキュメントが例示に使うキー(…EXAMPLEKEY)から導いた署名鍵で、どのアカウントの鍵でもない
+        // The expected value is a signing key derived from the example key in the AWS documentation (...EXAMPLEKEY),
+        // not a key of any account
         let expected = "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"; // pragma: allowlist secret
         assert_eq!(hex(&key), expected);
     }
