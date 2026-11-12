@@ -9,6 +9,16 @@
 *.db-wal
 *.db-shm
 
+# 秘密を入れがちなファイル。エミュレータの CA(ca.pem)やクレデンシャル(emulator_credentials)を
+# 手元に写したときも、誤ってコミットしないように外す
+.env
+.env.*
+*.pem
+*.key
+*.p12
+emulator_credentials
+credentials
+
 # 手元に置いた aws-emulator 本体(別ライセンスの配布物)
 /aws-emulator
 
