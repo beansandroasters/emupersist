@@ -240,7 +240,8 @@ fn concurrent_writes_to_one_item_survive_restart_in_order() {
                 let (e, barrier) = (&e, &barrier);
                 s.spawn(move || {
                     barrier.wait();
-                    let item = json!({"TableName": "tbl", "Item": {"k": {"S": "same"}, "v": {"S": format!("client-{i}")}}});
+                    let item =
+                        json!({"TableName": "tbl", "Item": {"k": {"S": "same"}, "v": {"S": format!("client-{i}")}}});
                     assert_eq!(e.json("dynamodb", "DynamoDB_20120810.PutItem", item).0, 200);
                 });
             }
