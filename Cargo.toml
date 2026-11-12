@@ -16,7 +16,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 ring = "0.17"
 serde_json = "1"
-miniz_oxide = "0.8"
+miniz_oxide = "0.9"
 libc = "0.2"  # SIGTERM の送受信だけ。ring が既に引いているので木は増えない
 rusqlite = { version = "0.41", features = ["bundled"], optional = true }
 
