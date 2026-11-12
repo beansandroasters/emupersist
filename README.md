@@ -217,6 +217,8 @@ cargo test                                                  # unit tests
 EMUPERSIST_TEST_EMULATOR=/path/to/aws-emulator cargo test   # also round-trip tests against a real emulator
 ```
 
+CI (`.github/workflows/ci.yml`) runs fmt, clippy and the unit tests, builds with the minimum supported Rust (1.89), and runs the round-trip tests against aws-emulator downloaded from the official site. The package is used only after its GPG signature verifies with a pinned signing-key fingerprint.
+
 The round-trip tests check that:
 
 - DynamoDB items, KMS key IDs and aliases, and S3 binaries (byte for byte) survive a restart

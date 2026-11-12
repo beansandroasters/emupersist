@@ -217,6 +217,8 @@ cargo test                                                  # 単体テスト
 EMUPERSIST_TEST_EMULATOR=/path/to/aws-emulator cargo test   # 本物のエミュレータを相手にした往復テストも回す
 ```
 
+CI(`.github/workflows/ci.yml`)では、fmt、clippy、単体テストを回し、最低対応の Rust(1.89)でビルドできるかも確かめます。往復テストには、公式の配布元から取得した aws-emulator を使います。取得したパッケージは、GPG の署名が固定した鍵の指紋で検証できたときだけ使います。
+
 往復テストでは次のことを確かめます。
 
 - DynamoDB の項目、KMS のキー ID とエイリアス、S3 のバイナリ(1バイト単位で)が、再起動の後も残っている

@@ -1,0 +1,97 @@
+# ビルドとテスト。Dependabot の更新 PR が、セキュリティ検査だけ緑で実は壊れている、を防ぐ。
+# 守っていること(権限・SHA 固定・認証情報・キャッシュ)は security.yml の冒頭と同じ。
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # clippy や rustfmt の判定が、ランナーの stable の更新で勝手に変わらないよう固定する(上げるときは手で)
+  RUST_TOOLCHAIN: "1.93.0"
+  CARGO_TERM_COLOR: never
+
+jobs:
+  lint-test:
+    name: fmt, clippy, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        # rustup はランナーに入っているものを使う(配布物の署名は rustup が検証する)
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - run: cargo test --locked
+      - run: cargo test --locked --no-default-features
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.89
+        # Cargo.toml の rust-version と揃える
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - run: cargo +1.89.0 build --locked --all-features --all-targets
+
+  e2e:
+    name: round-trip tests against aws-emulator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      # aws-emulator の配布物に署名する鍵の指紋。鍵の配布元が差し替えられても、ここで止める
+      EMULATOR_SIGNING_KEY: 98BCF336A3BE53B734E967C52E5BF49BD940F624
+      EMULATOR_BASE: https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Download and verify aws-emulator
+        # 配布元は版を指定したパスを持たない(LTS/latest だけ)。だから中身は署名で確かめる:
+        # 署名が正しいことと、署名した鍵が上の指紋の鍵であることの両方を要求する
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/emu" && cd "$RUNNER_TEMP/emu"
+          curl -fsSLO "$EMULATOR_BASE/aws-emulator_amd64.deb"
+          curl -fsSLO "$EMULATOR_BASE/aws-emulator_amd64.deb.sig"
+          curl -fsSLo key.asc https://downloads.aws.com/keys/gpg/current.asc
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --import key.asc
+          gpg --batch --status-fd 1 --verify aws-emulator_amd64.deb.sig aws-emulator_amd64.deb > status.txt
+          grep -q "^\[GNUPG:\] VALIDSIG $EMULATOR_SIGNING_KEY " status.txt
+          dpkg-deb -x aws-emulator_amd64.deb root
+          root/opt/aws-emulator/bin/aws-emulator --version
+          echo "EMUPERSIST_TEST_EMULATOR=$PWD/root/opt/aws-emulator/bin/aws-emulator" >> "$GITHUB_ENV"
+      - name: cargo test (e2e)
+        # テストはエミュレータを -t off(テレメトリなし)で起動する
+        run: cargo test --locked --test e2e
