@@ -13,7 +13,8 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 pub type Headers = Vec<(String, String)>;
 
-/// Headers that govern framing of the transfer. The proxy does not forward them and sets them itself.
+/// Hop-by-hop headers: they describe one connection, not the message. The proxy does not forward them and sets its
+/// own.
 pub const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",

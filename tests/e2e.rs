@@ -99,6 +99,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         if let Some(mut c) = self.child.take() {
+            // SAFETY: only sends SIGTERM to a child this process started and has not reaped yet
             unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) };
             let _ = c.wait();
         }
@@ -326,6 +327,7 @@ fn emulator_does_not_outlive_a_killed_proxy() {
     let mut e = Running::start(&emu, &format!("file:{}/j.jsonl", tmpdir("orphan")), &[]);
     let upstream: Value = serde_json::from_slice(&e.admin("GET", "status").body).unwrap();
     let port: u16 = upstream["upstream"].as_str().unwrap().rsplit(':').next().unwrap().parse().unwrap();
+    // SAFETY: only sends SIGKILL to a child this process started and has not reaped yet (it is reaped right below)
     unsafe { libc::kill(e.pid() as libc::pid_t, libc::SIGKILL) };
     e.child.take().unwrap().wait().unwrap();
     for _ in 0..50 {

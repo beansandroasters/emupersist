@@ -293,8 +293,8 @@ impl AwsHttp {
     }
 }
 
-/// The number of retries to AWS (not counting the first attempt). The interval starts at 100ms and doubles, ending
-/// at around 1.6 seconds.
+/// The number of retries to AWS (not counting the first attempt). The waits are 100, 200, 400 and 800 ms, each plus
+/// up to 50% jitter, so the last wait is 0.8 to 1.2 seconds.
 const RETRIES: u32 = 4;
 
 fn is_throttle(body: &[u8]) -> bool {
