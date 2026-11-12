@@ -1,0 +1,23 @@
+# ビルド成果物
+/target/
+
+# ジャーナル(記録した要求の本文がそのまま入る: シークレットの値、アクセスキー ID など)。
+# 既定の置き場所と、利用者が手元に作りがちな保存先。誤ってコミットしないよう広めに外す
+.emupersist/
+*.jsonl
+*.db
+*.db-wal
+*.db-shm
+
+# 手元に置いた aws-emulator 本体(別ライセンスの配布物)
+/aws-emulator
+
+# エディタ・OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# 互換テストの見本ジャーナル(テスト用の値だけが入っている)
+!/tests/fixtures/*.jsonl

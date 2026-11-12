@@ -1,0 +1,29 @@
+[package]
+name = "emupersist"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"  # 依存の最低バージョンのうち最大のもの(rusqlite 0.41)
+description = "A proxy that persists AWS Emulator state by journaling state-changing requests and replaying them on restart"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/beansandroasters/emupersist"
+readme = "README.md"
+keywords = ["aws", "emulator", "testing", "persistence", "proxy"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+# 依存は意図して最小にしている(理由は README.md)。非同期ランタイム・HTTP フレームワーク・CLI パーサは入れない。
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+ring = "0.17"
+serde_json = "1"
+miniz_oxide = "0.8"
+libc = "0.2"  # SIGTERM の送受信だけ。ring が既に引いているので木は増えない
+rusqlite = { version = "0.41", features = ["bundled"], optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
+
+[profile.release]
+strip = true
+lto = true
