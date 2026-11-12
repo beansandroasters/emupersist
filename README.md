@@ -149,7 +149,10 @@ So the following are never learned:
   A request that succeeded when recorded but fails now is retried with growing intervals.
   The total time spent retrying across the whole replay is capped by `--replay-retry-seconds`, so that a version change causing many mismatches does not stall startup for long.
   A failed request did not change state, so retrying cannot apply it twice.
-- **Concurrent writes are recorded in the order their responses returned.** Two requests that ran in parallel can be recorded in a different order from the one the emulator applied.
+- **Writes are processed one at a time.** From sending a write to the emulator until it is recorded, emupersist holds a single lock, so the journal order always matches the order the emulator applied.
+  Without it, when 8 clients wrote the same item at once, the value left after a restart changed in 14 of 20 trials. With it, 0 of 20.
+  The cost is throughput: with 8 clients writing different items at once, emupersist handled about half as many writes per second (about 1,100–1,300 instead of 2,400–2,500, measured side by side on a busy machine). A slow write, such as a synchronous Lambda Invoke, makes other writes wait.
+  SQS ReceiveMessage is not serialized, because a long poll can wait up to 20 seconds.
 - **The journal only grows.** The internal state cannot be serialized, so the journal cannot be compacted. Run `reset` to start over when needed.
 - **Whether a request is a write is a guess.** RPC operations are judged by name prefix (`Describe*` / `List*` / `Get*` ...), and REST operations by HTTP method.
   When unsure, the request is recorded as a write. Use `--write-op` / `--read-op` when the guess is wrong.

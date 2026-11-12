@@ -217,6 +217,46 @@ fn state_survives_restart() {
     assert!(log.contains("食い違い 0 件"), "{log}");
 }
 
+/// 複数のクライアントが同じ項目を同時に書き換えても、再起動の後に最後の値が入れ替わらない。
+/// 書き込みを並行に通していた版では、8 クライアントで 20 回中 14 回入れ替わった。
+#[test]
+fn concurrent_writes_to_one_item_survive_restart_in_order() {
+    let Some(emu) = emulator() else { return };
+    for round in 0..5 {
+        let store = format!("file:{}/j.jsonl", tmpdir(&format!("concurrent-{round}")));
+        let e = Running::start(&emu, &store, &[]);
+        let (st, out) = e.json(
+            "dynamodb",
+            "DynamoDB_20120810.CreateTable",
+            json!({"TableName": "tbl", "BillingMode": "PAY_PER_REQUEST",
+                   "AttributeDefinitions": [{"AttributeName": "k", "AttributeType": "S"}],
+                   "KeySchema": [{"AttributeName": "k", "KeyType": "HASH"}]}),
+        );
+        assert_eq!(st, 200, "{out}");
+        wait_active(&e, "tbl");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let (e, barrier) = (&e, &barrier);
+                s.spawn(move || {
+                    barrier.wait();
+                    let item = json!({"TableName": "tbl", "Item": {"k": {"S": "same"}, "v": {"S": format!("client-{i}")}}});
+                    assert_eq!(e.json("dynamodb", "DynamoDB_20120810.PutItem", item).0, 200);
+                });
+            }
+        });
+        let get = |e: &Running| {
+            let key = json!({"TableName": "tbl", "Key": {"k": {"S": "same"}}});
+            e.json("dynamodb", "DynamoDB_20120810.GetItem", key).1["Item"]["v"]["S"].as_str().map(str::to_string)
+        };
+        let before = get(&e);
+        e.stop();
+        let e = Running::start(&emu, &store, &[]);
+        assert_eq!(get(&e), before, "round {round}");
+        e.stop();
+    }
+}
+
 /// 形式 v1 のジャーナル(別の実装で記録した見本)を、そのまま読んで状態を戻せる。保存形式を変えていないことの確認。
 #[test]
 fn replays_v1_journal_fixture() {

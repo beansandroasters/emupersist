@@ -277,6 +277,10 @@ pub struct Proxy {
     /// 要求の処理(エミュレータへの送信から記録まで)は read、reset は write で取る。
     /// reset の途中に古いエミュレータで成功した書き込みが、消したばかりのジャーナルに混ざらないため
     pub gate: RwLock<()>,
+    /// 書き込み系のリクエストは、エミュレータへの送信から記録までをこのロックの中で1本ずつ行う。
+    /// 並行に通すと、記録の順(レスポンスが返った順)がエミュレータの適用した順とずれ、同じ項目を同時に
+    /// 書き換えたときに、リプレイで最後に残る値が入れ替わる(実測: 8 クライアントで 20 回中 14 回)
+    pub write_lock: Mutex<()>,
     pub extra_writes: HashSet<String>,
     pub extra_reads: HashSet<String>,
     pub on_reset: Option<ResetFn>,
@@ -359,6 +363,10 @@ impl Proxy {
         let _g = self.gate.read().unwrap_or_else(|e| e.into_inner());
         let op = classify::operation_name(&req.method, &req.target, &req.headers, &req.body);
         let mut mutating = classify::is_mutating(&req.method, op.as_deref(), &self.extra_writes, &self.extra_reads);
+        // SQS の ReceiveMessage はロングポーリングで最大 20 秒待つので、順番待ちに入れるとほかの書き込みが
+        // 止まる。受信どうし・受信と送信の順は、リプレイ後の状態への影響が小さいので外す
+        let _w = (mutating && op.as_deref() != Some("ReceiveMessage"))
+            .then(|| self.write_lock.lock().unwrap_or_else(|e| e.into_inner()));
         let (upstream, idmap) = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         let (path, fh, fb) = idmap.to_emulator(&req.method, &req.target, &req.headers, &req.body);
         let resp = match upstream.send(&req.method, &path, &fh, &fb) {

@@ -276,6 +276,7 @@ fn run(a: Args) -> Result<i32, String> {
         journal,
         state: RwLock::new((Arc::new(upstream), Arc::new(idmap))),
         gate: RwLock::new(()),
+        write_lock: Mutex::new(()),
         extra_writes: a.write_ops,
         extra_reads: a.read_ops,
         on_reset,
